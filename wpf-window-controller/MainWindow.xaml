@@ -114,112 +114,6 @@
         </Grid.Resources>
 
         <TabControl Style="{StaticResource DarkTabControl}" SelectedIndex="0">
-            <!-- ========== 设置标签页 ========== -->
-            <TabItem Header="设置" Style="{StaticResource DarkTabItem}">
-                <ScrollViewer VerticalScrollBarVisibility="Auto">
-                    <StackPanel Margin="16">
-                        <!-- 连接设置 -->
-                        <TextBlock Text="连接设置" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
-                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
-                            <StackPanel>
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="140"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Grid.Column="0" Text="sunshine.exe 路径：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
-                                    <ComboBox Grid.Column="1" x:Name="SunshinePathBox" Margin="8,0,0,0"
-                                              IsEditable="True" Style="{StaticResource DarkEditableComboBox}"
-                                              ToolTip="选择 sunshine.exe 路径。留空则仅控制已运行的 Sunshine。"/>
-                                </Grid>
-                                <Grid Margin="0,8,0,0">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="140"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Grid.Column="0" Text="Web UI 地址：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
-                                    <TextBox Grid.Column="1" x:Name="BaseUrlBox" Margin="8,0,0,0"
-                                             Foreground="White" Background="#FF3F3F46" BorderThickness="0"
-                                             Text="https://localhost:47990" VerticalAlignment="Center"/>
-                                </Grid>
-                                <Grid Margin="0,8,0,0">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="140"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Grid.Column="0" Text="用户名 / 密码：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
-                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
-                                        <TextBox x:Name="UsernameBox" Width="120" Margin="0,0,8,0"
-                                                 Foreground="White" Background="#FF3F3F46" BorderThickness="0" VerticalAlignment="Center"/>
-                                        <PasswordBox x:Name="PasswordBox" Width="120"
-                                                     Foreground="White" Background="#FF3F3F46" BorderThickness="0" VerticalAlignment="Center"/>
-                                    </StackPanel>
-                                </Grid>
-                            </StackPanel>
-                        </Border>
-
-                        <!-- 焦点伪造选项 -->
-                        <TextBlock Text="焦点伪造选项" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
-                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
-                            <StackPanel>
-                                <CheckBox x:Name="BlockKbMouseCheck" Tag="BlockKeyboardMouse"
-                                          Content="屏蔽键鼠输入（XInput 手柄始终有效）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="RawInputCheck" Tag="DisableRawInput"
-                                          Content="禁用 Raw Input 钩子（默认关——屏蔽键鼠靠它，开着才生效）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="BlockLegacyMessagesCheck" Tag="BlockLegacyMessages"
-                                          Content="窗口过程层屏蔽（需子类化，re9 上默认关以避免闪退）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="SuspendOnPatchCheck" Tag="SuspendThreadsOnPatch"
-                                          Content="打补丁时冻结线程"
-                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="EnableSubclassCheck" Tag="EnableSubclass"
-                                          Content="启用窗口子类化（旧方式，多数游戏建议关闭）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="BlockCursorHideCheck" Tag="BlockCursorHide"
-                                          Content="阻止游戏隐藏鼠标（Hook ShowCursor）"
-                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="BlockCursorLockCheck" Tag="BlockCursorLock"
-                                          Content="阻止游戏锁定鼠标（Hook ClipCursor/GetClipCursor）"
-                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-
-                                <CheckBox x:Name="DisableAllCheck" Tag="DisableFocusSpoof"
-                                          Content="禁用全部（仅加载 DLL）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                            </StackPanel>
-                        </Border>
-
-                        <!-- 启动按钮 -->
-                        <Button x:Name="LaunchButton" Content="启动 Sunshine" Padding="12,5"
-                                Click="LaunchButton_Click" Background="#FF3E7C17" Foreground="White" BorderThickness="0"
-                                HorizontalAlignment="Left" Width="140" Margin="0,0,0,8"/>
-
-                        <!-- 配置保存/加载 -->
-                        <StackPanel Orientation="Horizontal" Margin="0,4,0,8">
-                            <Button x:Name="SaveConfigButton" Content="保存配置" Padding="12,5"
-                                    Click="SaveConfigButton_Click" Background="#FF0E639C" Foreground="White" BorderThickness="0"/>
-                            <Button x:Name="LoadConfigButton" Content="加载配置" Padding="12,5" Margin="8,0,0,0"
-                                    Click="LoadConfigButton_Click" Background="#FF0E639C" Foreground="White" BorderThickness="0"/>
-                            <TextBlock Text="保存/加载全部焦点伪造选项到配置文件" Foreground="#FF8A8A8A"
-                                       VerticalAlignment="Center" Margin="12,0,0,0"/>
-                        </StackPanel>
-
-                        <!-- 状态 -->
-                        <TextBlock x:Name="StatusText" Text="就绪。" Foreground="#FFCFCFCF"
-                                   TextTrimming="CharacterEllipsis"/>
-                    </StackPanel>
-                </ScrollViewer>
-            </TabItem>
-
             <!-- ========== 录制目标标签页 ========== -->
             <TabItem Header="录制目标" Style="{StaticResource DarkTabItem}">
                 <Grid>
@@ -348,6 +242,140 @@
                     <TextBlock Grid.Row="2" Text="点击窗口只切换 Sunshine 录制目标（点击桌面切回全屏）；点击窗口右侧按钮才会注入/卸载焦点伪造。"
                                Foreground="#FF8A8A8A" Margin="0,8,0,0" TextWrapping="Wrap"/>
                 </Grid>
+            </TabItem>
+
+            <!-- ========== 设置标签页 ========== -->
+            <TabItem Header="设置" Style="{StaticResource DarkTabItem}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="16">
+                        <!-- 连接设置 -->
+                        <TextBlock Text="连接设置" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="140"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="sunshine.exe 路径：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
+                                    <ComboBox Grid.Column="1" x:Name="SunshinePathBox" Margin="8,0,0,0"
+                                              IsEditable="True" Style="{StaticResource DarkEditableComboBox}"
+                                              ToolTip="默认相对路径 ./sunshine.exe（即本程序所在目录）。请使用 YuanSunshine 构建版本。"/>
+                                </Grid>
+                                <TextBlock Text="默认使用相对路径 ./sunshine.exe（即本程序所在目录）。请务必使用 YuanSunshine 构建版本的 sunshine.exe。"
+                                           Foreground="#FFE0B84C" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,10"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="140"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="Web UI 地址：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
+                                    <TextBox Grid.Column="1" x:Name="BaseUrlBox" Margin="8,0,0,0"
+                                             Foreground="White" Background="#FF3F3F46" BorderThickness="0"
+                                             Text="https://localhost:47990" VerticalAlignment="Center"/>
+                                </Grid>
+                                <Grid Margin="0,8,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="140"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="用户名 / 密码：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                        <TextBox x:Name="UsernameBox" Width="120" Margin="0,0,8,0"
+                                                 Foreground="White" Background="#FF3F3F46" BorderThickness="0" VerticalAlignment="Center"/>
+                                        <PasswordBox x:Name="PasswordBox" Width="120"
+                                                     Foreground="White" Background="#FF3F3F46" BorderThickness="0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 焦点伪造选项 -->
+                        <TextBlock Text="焦点伪造选项" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                            <StackPanel>
+                                <CheckBox x:Name="BlockKbMouseCheck" Tag="BlockKeyboardMouse"
+                                          Content="屏蔽键鼠输入（XInput 手柄始终有效）"
+                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                                <CheckBox x:Name="RawInputCheck" Tag="DisableRawInput"
+                                          Content="禁用 Raw Input 钩子（默认关——屏蔽键鼠靠它，开着才生效）"
+                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                                <CheckBox x:Name="BlockLegacyMessagesCheck" Tag="BlockLegacyMessages"
+                                          Content="窗口过程层屏蔽（需子类化，re9 上默认关以避免闪退）"
+                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                                <CheckBox x:Name="SuspendOnPatchCheck" Tag="SuspendThreadsOnPatch"
+                                          Content="打补丁时冻结线程"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                                <CheckBox x:Name="EnableSubclassCheck" Tag="EnableSubclass"
+                                          Content="启用窗口子类化（旧方式，多数游戏建议关闭）"
+                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                                <CheckBox x:Name="BlockCursorHideCheck" Tag="BlockCursorHide"
+                                          Content="阻止游戏隐藏鼠标（Hook ShowCursor）"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                                <CheckBox x:Name="BlockCursorLockCheck" Tag="BlockCursorLock"
+                                          Content="阻止游戏锁定鼠标（Hook ClipCursor/GetClipCursor）"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+
+                                <CheckBox x:Name="DisableAllCheck" Tag="DisableFocusSpoof"
+                                          Content="禁用全部（仅加载 DLL）"
+                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 启动按钮 -->
+                        <Button x:Name="LaunchButton" Content="启动 Sunshine" Padding="12,5"
+                                Click="LaunchButton_Click" Background="#FF3E7C17" Foreground="White" BorderThickness="0"
+                                HorizontalAlignment="Left" Width="140" Margin="0,0,0,8"/>
+
+                        <!-- 配置保存/加载 -->
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,8">
+                            <Button x:Name="SaveConfigButton" Content="保存配置" Padding="12,5"
+                                    Click="SaveConfigButton_Click" Background="#FF0E639C" Foreground="White" BorderThickness="0"/>
+                            <Button x:Name="LoadConfigButton" Content="加载配置" Padding="12,5" Margin="8,0,0,0"
+                                    Click="LoadConfigButton_Click" Background="#FF0E639C" Foreground="White" BorderThickness="0"/>
+                            <TextBlock Text="保存/加载全部焦点伪造选项到配置文件" Foreground="#FF8A8A8A"
+                                       VerticalAlignment="Center" Margin="12,0,0,0"/>
+                        </StackPanel>
+
+                        <!-- 状态 -->
+                        <TextBlock x:Name="StatusText" Text="就绪。" Foreground="#FFCFCFCF"
+                                   TextTrimming="CharacterEllipsis"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ========== 关于标签页 ========== -->
+            <TabItem Header="关于" Style="{StaticResource DarkTabItem}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="24" MaxWidth="720">
+                        <TextBlock Text="Sunshine 窗口控制器" FontWeight="Bold" Foreground="White" FontSize="18" Margin="0,0,0,4"/>
+                        <TextBlock Text="YuanSunshine · 进程串流控制器" Foreground="#FFCFCFCF" Margin="0,0,0,20"/>
+
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                            <StackPanel>
+                                <TextBlock Text="本软件的进程串流功能，参考了“伙伴串流网”的星喵小桌面。"
+                                           Foreground="#FFCFCFCF" TextWrapping="Wrap" LineHeight="22"/>
+                                <TextBlock Text="星喵小桌面具有完备的进程串流能力，欢迎前往体验：www.palstreaming.com"
+                                           Foreground="#FFCFCFCF" TextWrapping="Wrap" LineHeight="22" Margin="0,6,0,0"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                            <TextBlock Text="进程串流采用 HOOK 技术实现，存在被误判为作弊软件的可能，因此请勿用于网游环境。"
+                                       Foreground="#FFE0B84C" TextWrapping="Wrap" LineHeight="22"/>
+                        </Border>
+
+                        <TextBlock Text="感谢您的支持。" Foreground="White" FontSize="15" Margin="0,4,0,0"/>
+                    </StackPanel>
+                </ScrollViewer>
             </TabItem>
         </TabControl>
     </Grid>

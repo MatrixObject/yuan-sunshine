@@ -18,8 +18,8 @@ namespace SunshineWindowController.Services
         /// <summary>Web UI 密码</summary>
         public string Password { get; set; } = "";
 
-        /// <summary>sunshine.exe 路径</summary>
-        public string SunshineExePath { get; set; } = "";
+        /// <summary>sunshine.exe 路径，默认相对路径 ./sunshine.exe（即本程序所在目录）</summary>
+        public string SunshineExePath { get; set; } = "./sunshine.exe";
 
         /// <summary>录制时保持游戏窗口激活（伪聚焦），默认开启</summary>
         public bool KeepFocused { get; set; } = true;

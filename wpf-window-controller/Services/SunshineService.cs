@@ -43,6 +43,27 @@ namespace SunshineWindowController.Services
         /// <summary>Web UI password.</summary>
         public string Password { get; set; } = "";
 
+        /// <summary>
+        /// 默认的 sunshine.exe 显示路径：相对路径 ./sunshine.exe（相对于本程序所在目录）。
+        /// </summary>
+        public static string DefaultExePath => "./sunshine.exe";
+
+        /// <summary>
+        /// 把用户输入的 sunshine.exe 路径解析为绝对路径：相对路径以本程序所在目录为基准。
+        /// </summary>
+        /// <param name="exePath">用户输入的可执行文件路径。</param>
+        /// <returns>解析后的绝对路径；输入为空时返回 null。</returns>
+        public static string ResolveExePath(string exePath)
+        {
+            if (string.IsNullOrWhiteSpace(exePath))
+                return null;
+
+            if (Path.IsPathRooted(exePath))
+                return exePath;
+
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, exePath);
+        }
+
         /// <summary>True when a sunshine.exe process is currently running.</summary>
         public static bool IsRunning()
         {
@@ -84,13 +105,14 @@ namespace SunshineWindowController.Services
             if (IsRunning())
                 return true;
 
-            if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+            var resolved = ResolveExePath(exePath);
+            if (string.IsNullOrWhiteSpace(resolved) || !File.Exists(resolved))
                 return false;
 
             var psi = new ProcessStartInfo
             {
-                FileName = exePath,
-                WorkingDirectory = Path.GetDirectoryName(exePath),
+                FileName = resolved,
+                WorkingDirectory = Path.GetDirectoryName(resolved),
                 UseShellExecute = false,
             };
 

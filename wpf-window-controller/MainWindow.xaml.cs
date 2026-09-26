@@ -151,8 +151,18 @@ namespace SunshineWindowController
             }
         }
 
+        private SunshineService CreateService()
+        {
+            return new SunshineService
+            {
+                BaseUrl = BaseUrlBox.Text.Trim(),
+                Username = UsernameBox.Text.Trim(),
+                Password = PasswordBox.Password,
+            };
+        }
+
         /// <summary>
-        /// 填充 sunshine.exe 路径下拉框。
+        /// 填充 sunshine.exe 路径下拉框：持久化路径优先，默认相对路径 ./sunshine.exe。
         /// </summary>
         private void PopulateSunshinePaths()
         {
@@ -171,38 +181,26 @@ namespace SunshineWindowController
             })
             {
                 if (System.IO.File.Exists(path))
-                {
                     choices.Add(path);
-                }
             }
 
             // 持久化的路径优先
             if (!string.IsNullOrWhiteSpace(_settings.SunshineExePath))
-            {
                 choices.Insert(0, _settings.SunshineExePath);
-            }
+
+            // 默认相对路径兜底
+            if (!choices.Contains(SunshineService.DefaultExePath))
+                choices.Add(SunshineService.DefaultExePath);
 
             foreach (var path in choices)
             {
                 if (!SunshinePathBox.Items.Contains(path))
-                {
                     SunshinePathBox.Items.Add(path);
-                }
             }
 
-            SunshinePathBox.Text = SunshinePathBox.Items.Count > 0
-                ? SunshinePathBox.Items[0] as string
-                : "";
-        }
-
-        private SunshineService CreateService()
-        {
-            return new SunshineService
-            {
-                BaseUrl = BaseUrlBox.Text.Trim(),
-                Username = UsernameBox.Text.Trim(),
-                Password = PasswordBox.Password,
-            };
+            SunshinePathBox.Text = string.IsNullOrWhiteSpace(_settings.SunshineExePath)
+                ? SunshineService.DefaultExePath
+                : _settings.SunshineExePath;
         }
 
         private async void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -211,11 +209,6 @@ namespace SunshineWindowController
             await SaveSettingsAsync();
             await RefreshTargetsAsync();
             _suppressSelection = false;
-        }
-
-        private async void SunshinePathBox_LostFocus(object sender, RoutedEventArgs e)
-        {
-            await SaveSettingsAsync();
         }
 
         private async Task SaveSettingsAsync()
