@@ -1,0 +1,567 @@
+using System;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media.Imaging;
+using SunshineWindowController.Models;
+using SunshineWindowController.Services;
+
+namespace SunshineWindowController
+{
+    /// <summary>
+    /// 主窗口：列出桌面和活跃窗口，点击切换 Sunshine 录制目标。
+    /// </summary>
+    public partial class MainWindow : Window
+    {
+        private readonly AppSettings _settings;
+        private bool _isRefreshing;
+        private bool _suppressSelection;
+        private int _refreshGeneration;
+
+        /// <summary>每个进程当前的 hook 状态（pid -> hooked）。用于在窗口列表刷新后恢复按钮文本。</summary>
+        private readonly System.Collections.Generic.Dictionary<uint, bool> _hookStateByPid =
+            new System.Collections.Generic.Dictionary<uint, bool>();
+
+        public ObservableCollection<CaptureTarget> Targets { get; } = new ObservableCollection<CaptureTarget>();
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            DataContext = this;
+
+            _settings = AppSettings.Load();
+
+            // 填充连接设置
+            BaseUrlBox.Text = _settings.BaseUrl;
+            UsernameBox.Text = _settings.Username;
+            PasswordBox.Password = _settings.Password;
+
+            PopulateSunshinePaths();
+
+            // 初始化配置文件
+            InitializeConfigFile();
+
+            // 焦点伪造选项
+            LoadFocusOptions();
+
+            // 初始刷新窗口列表
+            _ = RefreshTargetsAsync();
+        }
+
+        /// <summary>
+        /// 从配置文件加载焦点伪造选项到复选框。
+        /// </summary>
+        private void LoadFocusOptions()
+        {
+            BlockKbMouseCheck.IsChecked = FocusSpoof.GetOption("BlockKeyboardMouse", 0) != 0;
+            RawInputCheck.IsChecked = FocusSpoof.GetOption("DisableRawInput", 0) != 0;  // 默认不禁用（开钩子）
+            BlockLegacyMessagesCheck.IsChecked = FocusSpoof.GetOption("BlockLegacyMessages", 0) != 0;  // 默认关
+            SuspendOnPatchCheck.IsChecked = FocusSpoof.GetOption("SuspendThreadsOnPatch", _settings.SuspendThreadsOnPatch ? 1 : 0) != 0;
+            EnableSubclassCheck.IsChecked = FocusSpoof.GetOption("EnableSubclass", _settings.EnableSubclass ? 1 : 0) != 0;
+            BlockCursorHideCheck.IsChecked = FocusSpoof.GetOption("BlockCursorHide", _settings.BlockCursorHide ? 1 : 0) != 0;
+            BlockCursorLockCheck.IsChecked = FocusSpoof.GetOption("BlockCursorLock", _settings.BlockCursorLock ? 1 : 0) != 0;
+            DisableAllCheck.IsChecked = FocusSpoof.GetOption("DisableFocusSpoof", _settings.DisableAll ? 1 : 0) != 0;
+        }
+
+        /// <summary>
+        /// 初始化配置文件（如果不存在）。
+        /// </summary>
+        private void InitializeConfigFile()
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(FocusSpoof.ConfigPath);
+                if (!Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                if (!File.Exists(FocusSpoof.ConfigPath))
+                {
+                    var lines = new System.Collections.Generic.List<string>
+                    {
+                        "BlockKeyboardMouse=" + (_settings.BlockKeyboardMouse ? 1 : 0),
+                        "DisableRawInput=" + (_settings.DisableRawInput ? 1 : 0),
+                        "BlockLegacyMessages=" + (_settings.BlockLegacyMessages ? 1 : 0),
+                        "SuspendThreadsOnPatch=" + (_settings.SuspendThreadsOnPatch ? 1 : 0),
+                        "EnableSubclass=" + (_settings.EnableSubclass ? 1 : 0),
+                        "BlockCursorHide=" + (_settings.BlockCursorHide ? 1 : 0),
+                        "BlockCursorLock=" + (_settings.BlockCursorLock ? 1 : 0),
+                        "DisableFocusSpoof=" + (_settings.DisableAll ? 1 : 0),
+                    };
+                    File.WriteAllLines(FocusSpoof.ConfigPath, lines);
+                }
+            }
+            catch (Exception)
+            {
+                // 静默失败
+            }
+        }
+
+        private void FocusOption_Changed(object sender, RoutedEventArgs e)
+        {
+            if (sender is CheckBox box && box.Tag is string name && !string.IsNullOrEmpty(name))
+            {
+                // 保存到配置文件（DLL 从配置文件读取）
+                FocusSpoof.SetOption(name, box.IsChecked == true ? 1 : 0);
+                
+                // 同时更新 AppSettings（用于持久化）
+                if (_settings != null)
+                {
+                    UpdateSettingsFromCheckbox(box, name);
+                    _settings.Save();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 根据复选框状态更新 AppSettings 对象。
+        /// </summary>
+        private void UpdateSettingsFromCheckbox(CheckBox box, string optionName)
+        {
+            var value = box.IsChecked == true;
+            switch (optionName)
+            {
+                case "BlockKeyboardMouse":
+                    _settings.BlockKeyboardMouse = value;
+                    break;
+                case "DisableRawInput":
+                    _settings.DisableRawInput = value;
+                    break;
+                case "BlockLegacyMessages":
+                    _settings.BlockLegacyMessages = value;
+                    break;
+                case "SuspendThreadsOnPatch":
+                    _settings.SuspendThreadsOnPatch = value;
+                    break;
+                case "EnableSubclass":
+                    _settings.EnableSubclass = value;
+                    break;
+                case "BlockCursorHide":
+                    _settings.BlockCursorHide = value;
+                    break;
+                case "BlockCursorLock":
+                    _settings.BlockCursorLock = value;
+                    break;
+                case "DisableFocusSpoof":
+                    _settings.DisableAll = value;
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 填充 sunshine.exe 路径下拉框。
+        /// </summary>
+        private void PopulateSunshinePaths()
+        {
+            var choices = new System.Collections.Generic.List<string>();
+
+            // 已运行的 Sunshine 实例
+            var running = SunshineService.RunningPath();
+            if (!string.IsNullOrWhiteSpace(running))
+                choices.Add(running);
+
+            // 标准安装路径
+            foreach (var path in new[]
+            {
+                @"C:\Program Files\Sunshine\sunshine.exe",
+                @"C:\Program Files\Sunshine_Next\sunshine.exe",
+            })
+            {
+                if (System.IO.File.Exists(path))
+                {
+                    choices.Add(path);
+                }
+            }
+
+            // 持久化的路径优先
+            if (!string.IsNullOrWhiteSpace(_settings.SunshineExePath))
+            {
+                choices.Insert(0, _settings.SunshineExePath);
+            }
+
+            foreach (var path in choices)
+            {
+                if (!SunshinePathBox.Items.Contains(path))
+                {
+                    SunshinePathBox.Items.Add(path);
+                }
+            }
+
+            SunshinePathBox.Text = SunshinePathBox.Items.Count > 0
+                ? SunshinePathBox.Items[0] as string
+                : "";
+        }
+
+        private SunshineService CreateService()
+        {
+            return new SunshineService
+            {
+                BaseUrl = BaseUrlBox.Text.Trim(),
+                Username = UsernameBox.Text.Trim(),
+                Password = PasswordBox.Password,
+            };
+        }
+
+        private async void RefreshButton_Click(object sender, RoutedEventArgs e)
+        {
+            _suppressSelection = true;
+            await SaveSettingsAsync();
+            await RefreshTargetsAsync();
+            _suppressSelection = false;
+        }
+
+        private async void SunshinePathBox_LostFocus(object sender, RoutedEventArgs e)
+        {
+            await SaveSettingsAsync();
+        }
+
+        private async Task SaveSettingsAsync()
+        {
+            _settings.BaseUrl = BaseUrlBox.Text.Trim();
+            _settings.Username = UsernameBox.Text.Trim();
+            _settings.Password = PasswordBox.Password;
+            _settings.SunshineExePath = SunshinePathBox.Text.Trim();
+            _settings.Save();
+            await Task.Yield();
+        }
+
+        private async void LaunchButton_Click(object sender, RoutedEventArgs e)
+        {
+            await LaunchSunshineAsync();
+        }
+
+        private async Task LaunchSunshineAsync()
+        {
+            SetStatus("检查 Sunshine...");
+
+            var service = CreateService();
+            var exePath = SunshinePathBox.Text.Trim();
+
+            if (SunshineService.IsRunning())
+            {
+                SetStatus("Sunshine 已在运行。");
+            }
+            else if (!SunshineService.StartIfNeeded(exePath))
+            {
+                SetStatus("启动 Sunshine 失败，请检查路径。");
+                return;
+            }
+            else
+            {
+                SetStatus("已启动 Sunshine，等待 API 就绪...");
+            }
+
+            if (await service.WaitReadyAsync(TimeSpan.FromSeconds(15)))
+            {
+                SetStatus("Sunshine API 已就绪。");
+            }
+            else
+            {
+                SetStatus("Sunshine 已启动但 API 未响应。");
+            }
+
+            service.Dispose();
+        }
+
+        private async Task RefreshTargetsAsync()
+        {
+            if (_isRefreshing)
+                return;
+            _isRefreshing = true;
+            RefreshButton.IsEnabled = false;
+            var generation = ++_refreshGeneration;
+
+            try
+            {
+                SetStatus("枚举窗口...");
+
+                var spoofSnapshot = new System.Collections.Generic.Dictionary<uint, bool>(_hookStateByPid);
+                var result = await Task.Run(() =>
+                {
+                    var items = new System.Collections.Generic.List<CaptureTarget>();
+
+                    // 桌面条目
+                    items.Add(new CaptureTarget
+                    {
+                        Title = "桌面",
+                        Hwnd = IntPtr.Zero,
+                        Pid = 0,
+                        Subtitle = "全屏桌面录制",
+                        Thumbnail = ThumbnailCapture.CaptureDesktop(),
+                    });
+
+                    var infoList = WindowEnumerator.GetVisibleWindows();
+                    foreach (var w in infoList)
+                    {
+                        var thumb = ThumbnailCapture.CaptureWindow(w.Hwnd) ??
+                                    ThumbnailCapture.CreatePlaceholder(w.Title);
+                        bool spoofOn = spoofSnapshot.TryGetValue(w.Pid, out bool hooked) && hooked;
+                        items.Add(new CaptureTarget
+                        {
+                            Title = w.Title,
+                            Hwnd = w.Hwnd,
+                            Pid = w.Pid,
+                            Subtitle = "PID " + w.Pid,
+                            Thumbnail = thumb,
+                            IsFocusSpoofOn = spoofOn,
+                        });
+                    }
+                    return items;
+                });
+
+                Targets.Clear();
+                foreach (var item in result)
+                {
+                    Targets.Add(item);
+                }
+
+                TargetCountText.Text = "共找到 " + (result.Count - 1) + " 个窗口，加上桌面。";
+            }
+            catch (Exception ex)
+            {
+                SetStatus("刷新失败：" + ex.Message);
+            }
+            finally
+            {
+                _isRefreshing = false;
+                RefreshButton.IsEnabled = true;
+            }
+        }
+
+        private async void TargetList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_suppressSelection)
+                return;
+            if (e.AddedItems.Count == 0)
+                return;
+
+            var target = e.AddedItems[0] as CaptureTarget;
+            if (target == null)
+                return;
+
+            await SwitchTargetAsync(target);
+        }
+
+        private async void TargetList_PreviewMouseLeftButtonDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        {
+            // 重复点击已选中项时触发
+            if (_suppressSelection)
+                return;
+
+            // 点击每行右侧的「开启/关闭窗口伪聚焦」按钮时不重新切换录制目标
+            if (FindAncestor<Button>(e.OriginalSource as DependencyObject) != null)
+                return;
+
+            var item = TargetList.ContainerFromElement(e.OriginalSource as DependencyObject) as ListBoxItem;
+            if (item == null || !item.IsSelected)
+                return;
+
+            var target = item.DataContext as CaptureTarget;
+            if (target == null)
+                return;
+
+            await SwitchTargetAsync(target);
+        }
+
+        /// <summary>
+        /// 在可视树上向上查找指定类型的祖先元素，找不到返回 null。
+        /// </summary>
+        private static T FindAncestor<T>(DependencyObject node) where T : DependencyObject
+        {
+            while (node != null)
+            {
+                if (node is T match)
+                    return match;
+
+                node = node is System.Windows.Media.Visual || node is System.Windows.Media.Media3D.Visual3D
+                    ? System.Windows.Media.VisualTreeHelper.GetParent(node)
+                    : System.Windows.LogicalTreeHelper.GetParent(node);
+            }
+            return null;
+        }
+
+        private async Task SwitchTargetAsync(CaptureTarget target)
+        {
+            var service = CreateService();
+
+            if (!SunshineService.IsRunning())
+            {
+                SetStatus("Sunshine 未运行，正在启动...");
+                var exePath = SunshinePathBox.Text.Trim();
+                if (!SunshineService.StartIfNeeded(exePath))
+                {
+                    SetStatus("启动 Sunshine 失败，请检查路径。");
+                    service.Dispose();
+                    return;
+                }
+
+                var ready = await service.WaitReadyAsync(TimeSpan.FromSeconds(15));
+                if (!ready)
+                {
+                    SetStatus("Sunshine 已启动但 API 未就绪。");
+                    service.Dispose();
+                    return;
+                }
+            }
+
+            SetStatus("切换到：" + target.Title + (target.IsDesktop ? "" : " (PID " + target.Pid + ")"));
+
+            try
+            {
+                var status = target.IsDesktop
+                    ? await service.SwitchToWindowAsync(IntPtr.Zero)
+                    : await service.SwitchToPidAsync(target.Pid);
+
+                switch ((int)status)
+                {
+                    case 200:
+                        // 仅切换录制目标；是否注入焦点伪造由每行的「开启窗口伪聚焦」按钮决定。
+                        SetStatus("已切换到：" + target.Title + (target.IsDesktop ? "" : " (PID " + target.Pid + ")"));
+                        break;
+                    case 400:
+                        SetStatus("请求失败：无法解析目标窗口。");
+                        break;
+                    case 401:
+                        SetStatus("认证失败，请检查 Web UI 用户名/密码。");
+                        break;
+                    case 403:
+                        SetStatus("禁止访问：此地址的远程访问被阻止。");
+                        break;
+                    default:
+                        SetStatus("Sunshine 返回 HTTP " + (int)status + "。");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                SetStatus("请求失败：" + ex.Message);
+            }
+            finally
+            {
+                service.Dispose();
+            }
+        }
+
+        private void SetStatus(string message)
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.Invoke(() => StatusText.Text = message);
+            }
+            else
+            {
+                StatusText.Text = message;
+            }
+        }
+
+        /// <summary>
+        /// 列表每一行右侧的「开启窗口伪聚焦」/「关闭窗口伪聚焦」按钮。
+        /// 未注入过：首次点击注入 DLL；已注入且开启：点击调用 SpoofStop 卸载 hook；
+        /// 已注入但已卸载：点击调用 SpoofStart 重新启用（不重复注入，因为 DLL 已加载）。
+        /// </summary>
+        private async void FocusSpoofButton_Click(object sender, RoutedEventArgs e)
+        {
+            var button = sender as Button;
+            var target = button?.DataContext as CaptureTarget;
+            if (target == null || target.IsDesktop)
+                return;
+
+            button.IsEnabled = false;
+            try
+            {
+                if (target.IsFocusSpoofOn)
+                {
+                    SetStatus("正在关闭窗口伪聚焦：" + target.Title + " ...");
+                    var ok = await Task.Run(() => FocusSpoof.CallExport(target.Pid, "SpoofStop", out var msg)
+                        ? (true, msg)
+                        : (false, msg));
+                    SetStatus(ok.Item2);
+                    if (ok.Item1)
+                    {
+                        target.IsFocusSpoofOn = false;
+                        _hookStateByPid[target.Pid] = false;
+                    }
+                }
+                else if (_hookStateByPid.ContainsKey(target.Pid))
+                {
+                    // 之前已注入过、现在处于「已卸载」状态：调用导出函数重新启用，
+                    // 而不是再次注入（DLL 已加载，再次 LoadLibrary 不会重跑 DllMain）。
+                    SetStatus("正在开启窗口伪聚焦：" + target.Title + " ...");
+                    var ok = await Task.Run(() => FocusSpoof.CallExport(target.Pid, "SpoofStart", out var msg)
+                        ? (true, msg)
+                        : (false, msg));
+                    SetStatus(ok.Item2);
+                    if (ok.Item1)
+                    {
+                        target.IsFocusSpoofOn = true;
+                        _hookStateByPid[target.Pid] = true;
+                    }
+                }
+                else
+                {
+                    SetStatus("正在开启窗口伪聚焦：" + target.Title + " ...");
+                    var focusOk = await Task.Run(() => FocusSpoof.SpoofActivation(target.Pid, target.Hwnd, out string msg)
+                        ? (true, msg)
+                        : (false, msg));
+                    SetStatus(focusOk.Item2);
+                    if (focusOk.Item1)
+                    {
+                        target.IsFocusSpoofOn = true;
+                        _hookStateByPid[target.Pid] = true;
+                    }
+                }
+            }
+            finally
+            {
+                button.IsEnabled = true;
+            }
+        }
+
+        /// <summary>
+        /// 将当前所有焦点伪造选项写入配置文件（focus_options.txt + settings.json）。
+        /// </summary>
+        private async void SaveConfigButton_Click(object sender, RoutedEventArgs e)
+        {
+            WriteAllFocusOptions();
+
+            _settings.BlockKeyboardMouse = BlockKbMouseCheck.IsChecked == true;
+            _settings.DisableRawInput = RawInputCheck.IsChecked == true;
+            _settings.BlockLegacyMessages = BlockLegacyMessagesCheck.IsChecked == true;
+            _settings.SuspendThreadsOnPatch = SuspendOnPatchCheck.IsChecked == true;
+            _settings.EnableSubclass = EnableSubclassCheck.IsChecked == true;
+            _settings.BlockCursorHide = BlockCursorHideCheck.IsChecked == true;
+            _settings.BlockCursorLock = BlockCursorLockCheck.IsChecked == true;
+            _settings.DisableAll = DisableAllCheck.IsChecked == true;
+
+            await SaveSettingsAsync();
+            SetStatus("配置已保存到：" + FocusSpoof.ConfigPath);
+        }
+
+        /// <summary>
+        /// 从配置文件重新加载所有焦点伪造选项到界面。
+        /// </summary>
+        private void LoadConfigButton_Click(object sender, RoutedEventArgs e)
+        {
+            LoadFocusOptions();
+            SetStatus("配置已重新加载。");
+        }
+
+        /// <summary>
+        /// 把界面上的全部焦点伪造选项一次性写入 focus_options.txt。
+        /// </summary>
+        private void WriteAllFocusOptions()
+        {
+            FocusSpoof.SetOption("BlockKeyboardMouse", BlockKbMouseCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("DisableRawInput", RawInputCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("BlockLegacyMessages", BlockLegacyMessagesCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("SuspendThreadsOnPatch", SuspendOnPatchCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("EnableSubclass", EnableSubclassCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("BlockCursorHide", BlockCursorHideCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("BlockCursorLock", BlockCursorLockCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("DisableFocusSpoof", DisableAllCheck.IsChecked == true ? 1 : 0);
+        }
+    }
+}
