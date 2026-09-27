@@ -10,5 +10,5 @@ Sunshine 的分支。
 
 相关项目：
 
-- [Sunshine](https://github.com/LizardByte/Sunshine)
-- [星喵小桌面](https://www.palstreaming.com)
+- Sunshine：https://github.com/LizardByte/Sunshine
+- 星喵小桌面：https://www.palstreaming.com
