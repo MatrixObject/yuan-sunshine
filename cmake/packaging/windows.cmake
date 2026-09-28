@@ -16,9 +16,6 @@ install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)
 # Mandatory tools
 install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
 
-# proctap executable for process-isolated audio capture
-install(TARGETS proctap RUNTIME DESTINATION "." COMPONENT application)
-
 # Mandatory scripts
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sunshine-setup.ps1"
         DESTINATION "scripts"
@@ -98,11 +95,6 @@ set(CPACK_COMPONENT_DXGI_GROUP "Tools")
 set(CPACK_COMPONENT_FIREWALL_DISPLAY_NAME "Add Firewall Exclusions")
 set(CPACK_COMPONENT_FIREWALL_DESCRIPTION "Scripts to enable or disable firewall rules.")
 set(CPACK_COMPONENT_FIREWALL_GROUP "Scripts")
-
-# proctap tool
-set(CPACK_COMPONENT_PROCTAP_DISPLAY_NAME "proctap")
-set(CPACK_COMPONENT_PROCTAP_DESCRIPTION "Process-isolated audio capture utility for Sunshine.")
-set(CPACK_COMPONENT_PROCTAP_GROUP "Tools")
 
 # include specific packaging
 include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)

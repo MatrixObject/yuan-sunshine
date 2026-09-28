@@ -29,6 +29,12 @@ namespace platf::audio::tests {
   capture_e proc_mic_stream_ended_continuous(std::uint32_t target_frame_size, std::uint32_t output_channels, std::vector<float> &output);
   capture_e proc_mic_timeout(std::uint32_t frame_size, std::vector<float> &output);
   capture_e proc_mic_process_changed(std::vector<float> &output);
+  const wchar_t *process_loopback_device_path();
+  std::size_t process_loopback_params_size();
+  bool process_switch_gate_closed_for_desktop();
+  bool process_switch_backoff_blocks_same_pid();
+  bool process_switch_backoff_allows_different_pid();
+  capture_e wasapi_mic_process_switch();
 }  // namespace platf::audio::tests
 
 namespace {
@@ -472,5 +478,38 @@ TEST(WindowsAudioTest, ProcMicProcessChangeRequestsReinit) {
     platf::audio::tests::proc_mic_process_changed(out),
     platf::capture_e::reinit
   );
+}
+
+TEST(WindowsAudioTest, ProcessSwitchGateClosedForDesktop) {
+  EXPECT_FALSE(platf::audio::tests::process_switch_gate_closed_for_desktop());
+}
+
+TEST(WindowsAudioTest, ProcessSwitchBackoffBlocksSamePid) {
+  EXPECT_FALSE(platf::audio::tests::process_switch_backoff_blocks_same_pid());
+}
+
+TEST(WindowsAudioTest, ProcessSwitchBackoffAllowsDifferentPid) {
+  EXPECT_TRUE(platf::audio::tests::process_switch_backoff_allows_different_pid());
+}
+
+TEST(WindowsAudioTest, WasapiMicProcessSwitchRequestsReinit) {
+  EXPECT_EQ(
+    platf::audio::tests::wasapi_mic_process_switch(),
+    platf::capture_e::reinit
+  );
+}
+
+TEST(WindowsAudioTest, ProcessLoopbackDevicePathIsExactVirtualDeviceIdentifier) {
+  // Any extra path segment (e.g. a trailing GUID) makes the async activation
+  // complete with HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND).
+  const wchar_t *path = platf::audio::tests::process_loopback_device_path();
+  ASSERT_NE(path, nullptr);
+  EXPECT_STREQ(path, L"VAD\\Process_Loopback");
+}
+
+TEST(WindowsAudioTest, ProcessLoopbackActivationParamsBlobLayout) {
+  // DWORD TargetProcessId followed by the 4-byte loopback mode enum, wrapped by
+  // a 4-byte activation type: 12 bytes on the Windows ABI.
+  EXPECT_EQ(platf::audio::tests::process_loopback_params_size(), 12U);
 }
 #endif

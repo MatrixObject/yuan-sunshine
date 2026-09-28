@@ -25,10 +25,6 @@
 #include <utility>
 #include <vector>
 
-// lib includes
-#include <boost/process/v1.hpp>
-#include <boost/process/v1/windows.hpp>
-
 // platform includes
 #include <Audioclient.h>
 #include <avrt.h>
@@ -48,6 +44,49 @@
 // clang-format off
 #include "PolicyConfig.h"
 // clang-format on
+
+// WASAPI Process Loopback (Windows 10 build 20348+) activation types are
+// missing from the MinGW audioclient.h shipped with the toolchain, so the
+// small set used by per-process capture is declared here. The runtime API
+// (ActivateAudioInterfaceAsync) and the completion-handler interface are
+// present in the SDK import library and headers.
+#ifndef __AUDIOCLIENT_PROCESS_LOOPBACK_DEFINED
+#define __AUDIOCLIENT_PROCESS_LOOPBACK_DEFINED
+
+typedef enum AUDIOCLIENT_ACTIVATION_TYPE {
+  AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,
+  AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1,
+} AUDIOCLIENT_ACTIVATION_TYPE;
+
+typedef enum PROCESS_LOOPBACK_MODE {
+  PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0,
+  PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1,
+} PROCESS_LOOPBACK_MODE;
+
+typedef struct AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+  DWORD TargetProcessId;
+  PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
+} AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS;
+
+typedef struct AUDIOCLIENT_ACTIVATION_PARAMS {
+  AUDIOCLIENT_ACTIVATION_TYPE ActivationType;
+  union {
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
+  } loopback_union;
+} AUDIOCLIENT_ACTIVATION_PARAMS;
+
+/// Virtual device identifier selecting WASAPI process-isolated loopback capture.
+/// Passed verbatim as the device interface path to ActivateAudioInterfaceAsync;
+/// it must not be extended with a GUID or path suffix.
+static const PCWSTR VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK = L"VAD\\Process_Loopback";
+
+#endif  // __AUDIOCLIENT_PROCESS_LOOPBACK_DEFINED
+
+/// IID_IAgileObject is not exposed by all MinGW SDK versions.
+/// {94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}
+static const GUID IID_IAgileObject_local = {
+    0x94ea2b94, 0xe9cc, 0x49e0, { 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90 }
+};
 
 #ifdef DOXYGEN
 /**
@@ -241,7 +280,6 @@ namespace {
 using namespace std::literals;
 
 namespace platf::audio {
-  namespace bp = boost::process::v1;  ///< Alias for the Boost.Process API used by mic_proc_t.
 
   /**
    * @brief Release the COM or platform reference owned by the pointer.
@@ -581,6 +619,63 @@ namespace platf::audio {
     std::atomic_bool default_render_device_changed_flag;
   };
 
+  /// Backoff window after a failed Process Loopback activation: the audio
+  /// thread retries the process microphone at most this often instead of
+  /// re-activating in a tight loop whenever process capture is requested but
+  /// unavailable (e.g. the OS is older than Windows 10 build 20348).
+  constexpr auto PROC_CAPTURE_BACKOFF = std::chrono::seconds(5);
+
+  /// PID whose Process Loopback activation last failed, or 0 when no backoff is armed.
+  static std::uint32_t proc_capture_backoff_pid = 0;
+
+  /// Point in time until which process-capture retries are suppressed.
+  static std::chrono::steady_clock::time_point proc_capture_backoff_until;
+
+  /**
+   * @brief Whether a desktop (WASAPI) microphone should rebuild itself as a
+   *        process (Process Loopback) microphone.
+   *
+   * The /api/capture-window handler updates config::video.capture_process
+   * mid-session and rebuilds video capture via the switch_capture event, but
+   * audio has no equivalent event: the WASAPI microphone polls this gate from
+   * its sample loop and returns capture_e::reinit so the pipeline recreates
+   * the microphone through the factory. A failed activation arms a short
+   * backoff to avoid a reactivation storm; selecting a different target PID
+   * clears the backoff immediately.
+   *
+   * @return True when a process is targeted and no backoff suppresses the retry.
+   */
+  static bool process_capture_switch_pending() {
+    const auto pid = config::video.capture_process;
+    if (pid == 0) {
+      return false;
+    }
+    if (pid != proc_capture_backoff_pid) {
+      return true;
+    }
+    return std::chrono::steady_clock::now() >= proc_capture_backoff_until;
+  }
+
+  /**
+   * @brief Arm the process-capture backoff after a failed Process Loopback activation.
+   * @param pid Target PID whose activation failed.
+   */
+  static void arm_proc_capture_backoff(std::uint32_t pid) {
+    proc_capture_backoff_pid = pid;
+    proc_capture_backoff_until = std::chrono::steady_clock::now() + PROC_CAPTURE_BACKOFF;
+  }
+
+  /**
+   * @brief Clear any armed process-capture backoff.
+   *
+   * Called when process capture starts successfully or when capture returns
+   * to desktop mode, so a later target switch is acted on immediately.
+   */
+  static void clear_proc_capture_backoff() {
+    proc_capture_backoff_pid = 0;
+    proc_capture_backoff_until = {};
+  }
+
   /**
    * @brief WASAPI microphone capture stream and endpoint notification state.
    */
@@ -593,6 +688,15 @@ namespace platf::audio {
      * @return Capture status reported to the streaming pipeline.
      */
     capture_e sample(std::vector<float> &sample_out) override {
+      // Desktop -> process switch mid-session: /api/capture-window changed
+      // capture_process while this WASAPI microphone keeps looping. Ask the
+      // pipeline to rebuild the microphone so the factory activates Process
+      // Loopback for the target process; failed activations are throttled by
+      // the gate.
+      if (process_capture_switch_pending()) {
+        return capture_e::reinit;
+      }
+
       auto sample_size = sample_out.size();
 
       // Refill the sample buffer if needed
@@ -883,31 +987,122 @@ namespace platf::audio {
   };
 
   /**
-   * @brief Process-isolated audio capture backed by the external proctap utility.
+   * @brief Completion handler for ActivateAudioInterfaceAsync().
    *
-   * Spawns `proctap.exe --pid <pid> --stdout --format float32` as a child process
-   * and reads interleaved stereo float32 PCM from its stdout.  The captured stereo
-   * stream is upmixed into the channel layout requested by the client (2, 6, or 8
-   * channels) so that per-process capture can be served without WASAPI loopback.
+   * The async activation API invokes ActivateCompleted() on an MTA thread once
+   * the virtual audio interface (IAudioClient) is ready; the handler stores the
+   * operation and signals an event so the capture thread can collect the result.
+   */
+  class activate_completion_handler_t: public IActivateAudioInterfaceCompletionHandler {
+  public:
+    /**
+     * @brief Construct the handler.
+     * @param activated_event Event signalled from ActivateCompleted().
+     */
+    explicit activate_completion_handler_t(HANDLE activated_event):
+        ref_count(1), activated_event(activated_event), operation(nullptr) {
+    }
+
+    /// Virtual destructor (object is deleted through Release()).
+    virtual ~activate_completion_handler_t() {
+      if (operation) {
+        operation->Release();
+      }
+    }
+
+    /// @cond DOXYGEN_SHOULD_SKIP_THIS
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
+      if (!object) {
+        return E_POINTER;
+      }
+      // ActivateAudioInterfaceAsync marshals the completion handler back to an
+      // MTA thread and requires IAgileObject (the Free-Threaded Marshaler is
+      // not queried for this path); without it activation fails with
+      // E_ILLEGAL_METHOD_CALL.
+      if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler) ||
+          riid == IID_IAgileObject_local) {
+        *object = static_cast<IActivateAudioInterfaceCompletionHandler *>(this);
+        AddRef();
+        return S_OK;
+      }
+      *object = nullptr;
+      return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+      return InterlockedIncrement(&ref_count);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+      auto count = InterlockedDecrement(&ref_count);
+      if (count == 0) {
+        delete this;
+      }
+      return static_cast<ULONG>(count);
+    }
+
+    HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation *async_operation) override {
+      operation = async_operation;
+      operation->AddRef();
+      SetEvent(activated_event);
+      return S_OK;
+    }
+    /// @endcond
+
+    /**
+     * @brief Retrieve the activated interface once completion has fired.
+     * @param[out] activated Receives the resulting IUnknown (caller releases it).
+     * @return The activation HRESULT reported by the operation, or E_UNEXPECTED
+     *         when ActivateCompleted() has not run yet.
+     */
+    HRESULT result(IUnknown **activated) {
+      if (!operation) {
+        return E_UNEXPECTED;
+      }
+      HRESULT activation_hr = E_FAIL;
+      auto hr = operation->GetActivateResult(&activation_hr, activated);
+      if (FAILED(hr)) {
+        return hr;
+      }
+      return activation_hr;
+    }
+
+  private:
+    LONG ref_count;  ///< COM reference count.
+    HANDLE activated_event;  ///< Signalled when the async operation completes.
+    IActivateAudioInterfaceAsyncOperation *operation;  ///< Completed operation, if any.
+  };
+
+  /**
+   * @brief Per-process audio capture backed by in-process WASAPI Process Loopback.
    *
-   * @note proctap always produces 48 kHz audio; the @p sample_rate parameter in
-   *       init() is accepted for interface compatibility but ignored.
+   * Activates an IAudioClient against VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK for
+   * the target PID (Windows 10 build 20348+), so only that process' render
+   * output is captured - no helper executable or pipes.  Captured frames are
+   * normalised to interleaved stereo float32 and upmixed into the channel
+   * layout requested by the client (2, 6, or 8 channels).
+   *
+   * @note The stream is always normalised to 48 kHz; the @p sample_rate
+   *       parameter in init() is accepted for interface compatibility but a
+   *       mismatch is logged and resampled.
    */
   class mic_proc_t: public mic_t {
   public:
-    bp::ipstream pipe;  ///< Pipe that receives raw float32 audio from the proctap child process.
-    bp::child proc;     ///< Handle to the running proctap child process.
-    std::jthread reader;  ///< Background thread that drains proctap stdout into sample_buf.
+    std::jthread worker;  ///< Thread running WASAPI activation and the capture loop.
     std::mutex mutex;   ///< Guards sample_buf and stream_ended.
     std::condition_variable cv;  ///< Signalled when sample_buf gains or loses data.
-    std::vector<float> sample_buf;  ///< Accumulated interleaved stereo floats read from proctap.
+    std::vector<float> sample_buf;  ///< Accumulated interleaved stereo float32 frames.
     std::size_t max_buf {SAMPLE_RATE * 2 * 2};  ///< Maximum sample_buf capacity in floats (2 s stereo).
     std::uint32_t frame_size {0};  ///< Number of stereo frames consumed per sample() call.
     std::uint32_t channels {0};  ///< Output channel count (2, 6, or 8).
-    std::uint32_t process_id {0};  ///< Target process ID supplied to proctap.
+    std::uint32_t process_id {0};  ///< Target process ID captured by WASAPI.
     bool continuous_audio {false};  ///< When true, emit silence on timeout or stream end instead of an error.
-    bool stream_ended {false};  ///< Set by the reader when proctap stdout closes.
+    bool stream_ended {false};  ///< Set when the capture thread stops or fails to start.
     std::chrono::milliseconds sample_timeout {50};  ///< Maximum wait in sample() before returning timeout or silence.
+    HANDLE cancel_event {nullptr};  ///< Manual-reset event waking the capture thread for shutdown.
+    HANDLE activated_event {nullptr};  ///< Signalled by the worker once activate_status is final.
+    HANDLE async_done_event {nullptr};  ///< Signalled by the activation completion handler; worker-only.
+    HRESULT activate_status {E_FAIL};  ///< Activation result published by the capture thread.
 
     /**
      * @brief Default-construct an uninitialised process capture microphone.
@@ -915,10 +1110,14 @@ namespace platf::audio {
     mic_proc_t() = default;
 
     /**
-     * @brief Locate, spawn, and begin reading from the proctap helper.
+     * @brief Activate WASAPI Process Loopback for the target process.
+     *
+     * Starts the capture thread, which asynchronously activates the process
+     * loopback audio client; this call blocks until activation finishes (or
+     * fails) so the caller can fall back to desktop loopback on error.
      *
      * @param target_process_id PID of the process whose audio stream should be captured.
-     * @param sample_rate Audio sample rate in Hz (accepted for interface compatibility; must be 48 000).
+     * @param sample_rate Audio sample rate in Hz (the stream is normalised to 48 000).
      * @param target_frame_size Number of stereo frames per sample() call.
      * @param output_channels Output channel count (2, 6, or 8).
      * @param continuous Flag indicating whether silence should fill gaps instead of errors.
@@ -931,14 +1130,8 @@ namespace platf::audio {
       }
 
       if (sample_rate != SAMPLE_RATE) {
-        BOOST_LOG(warning) << "Process audio capture is locked to "sv << SAMPLE_RATE
-                           << " Hz; requested "sv << sample_rate << " Hz is ignored"sv;
-      }
-
-      auto proctap_path = find_proctap();
-      if (!proctap_path) {
-        BOOST_LOG(error) << "Couldn't locate proctap.exe next to Sunshine or on the PATH"sv;
-        return -1;
+        BOOST_LOG(warning) << "Process audio capture is normalised to "sv << SAMPLE_RATE
+                           << " Hz; requested "sv << sample_rate << " Hz will be resampled"sv;
       }
 
       process_id = target_process_id;
@@ -946,16 +1139,35 @@ namespace platf::audio {
       channels = output_channels;
       continuous_audio = continuous;
       stream_ended = false;
+      activate_status = E_FAIL;
 
-      std::error_code ec;
-      std::wstring cmd = L"\"" + proctap_path->wstring() + L"\" --pid " + std::to_wstring(process_id) + L" --stdout --format float32";
-      proc = bp::child(cmd, bp::std_out > pipe, bp::std_err > bp::null, bp::std_in < bp::null, bp::windows::create_no_window, ec);
-      if (ec || !proc.valid()) {
-        BOOST_LOG(error) << "Couldn't launch proctap: "sv << ec.message();
+      cancel_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      activated_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      async_done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (!cancel_event || !activated_event || !async_done_event) {
+        BOOST_LOG(error) << "Couldn't create process audio capture events"sv;
         return -1;
       }
 
-      reader = std::jthread([this](std::stop_token token) { reader_loop(token); });
+      worker = std::jthread([this](std::stop_token token) { capture_loop(token); });
+
+      // activated_event is only raised by the worker after activate_status has
+      // been published; the completion handler must never signal it directly,
+      // otherwise this wait would race ahead and read the initial E_FAIL.
+      HANDLE wait_handles[] {activated_event, cancel_event};
+      auto wait_result = WaitForMultipleObjects(2, wait_handles, FALSE, 10000);
+      if (wait_result != WAIT_OBJECT_0 || FAILED(activate_status)) {
+        BOOST_LOG(error) << "Couldn't activate WASAPI process audio capture for pid ["sv << process_id
+                         << "]: [0x"sv << util::hex(static_cast<std::uint32_t>(activate_status)).to_string_view()
+                         << ']';
+        if (worker.joinable()) {
+          SetEvent(cancel_event);
+          worker.request_stop();
+          worker.join();
+        }
+        return -1;
+      }
+
       return 0;
     }
 
@@ -1008,17 +1220,17 @@ namespace platf::audio {
     /**
      * @brief Deliver a captured audio sample to Sunshine's audio pipeline.
      *
-     * Blocks until frame_size stereo frames are available, the proctap stream
-     * closes, or sample_timeout elapses.  The stereo frames are upmixed to the
-     * output channel count before being written to @p sample_out.
+     * Blocks until frame_size stereo frames are available, the capture
+     * stream ends, or sample_timeout elapses.  The stereo frames are upmixed
+     * to the output channel count before being written to @p sample_out.
      *
      * @param sample_out Destination buffer; must be sized to frame_size * channels.
      * @return capture_e::ok on success, timeout when data is unavailable,
-     *         or error when the proctap stream has closed.
+     *         or error when the capture stream has ended.
      */
     capture_e sample(std::vector<float> &sample_out) override {
       // If the user targets a different process mid-session, ask the pipeline to rebuild
-      // the microphone so that proctap is spawned for the new process again.
+      // the microphone so a new Process Loopback client is activated.
       if (config::video.capture_process != process_id) {
         return capture_e::reinit;
       }
@@ -1049,64 +1261,166 @@ namespace platf::audio {
     }
 
     /**
-     * @brief Terminate the proctap child process and join the reader thread.
+     * @brief Stop capture and join the WASAPI capture thread, closing events.
      */
     ~mic_proc_t() override {
-      std::error_code ec;
-      if (proc.valid()) {
-        proc.terminate(ec);
+      if (cancel_event) {
+        SetEvent(cancel_event);
       }
       cv.notify_all();
-      if (reader.joinable()) {
-        reader.join();
+      if (worker.joinable()) {
+        worker.request_stop();
+        worker.join();
+      }
+      if (cancel_event) {
+        CloseHandle(cancel_event);
+      }
+      if (activated_event) {
+        CloseHandle(activated_event);
+      }
+      if (async_done_event) {
+        CloseHandle(async_done_event);
       }
     }
 
   private:
     /**
-     * @brief Drain proctap stdout and accumulate interleaved stereo floats.
+     * @brief Activate the Process Loopback audio client and pump packets.
      *
-     * Runs on a dedicated thread until proctap closes its stdout or a stop is
-     * requested.  Partial byte sequences are preserved across read calls so
-     * that float alignment is always maintained.
+     * Runs on the worker thread with its own MTA COM initialisation (required
+     * by ActivateAudioInterfaceAsync).  Publishes activate_status and signals
+     * activated_event once activation succeeds or fails, then loops over
+     * captured packets until shutdown.  Any failure marks stream_ended so
+     * sample() reports silence or an error depending on continuous_audio.
      *
      * @param token Stop token used to request an early exit.
      */
-    void reader_loop(std::stop_token token) {
-      std::array<char, 4096> read_buf {};
-      std::vector<std::uint8_t> pending;
+    void capture_loop(std::stop_token token) {
+      co_init_t com;
 
-      for (;;) {
-        if (token.stop_requested()) {
+      // Schedule the capture thread with the same Pro Audio MMCSS task as the
+      // desktop loopback path to keep activation and packet pumping responsive.
+      DWORD mmcss_task_index = 0;
+      auto *mmcss_task = AvSetMmThreadCharacteristics("Pro Audio", &mmcss_task_index);
+      if (!mmcss_task) {
+        BOOST_LOG(warning) << "Couldn't associate process audio capture thread with Pro Audio MMCSS task [0x"
+                           << util::hex(GetLastError()).to_string_view() << ']';
+      }
+      auto mmcss_cleanup = util::fail_guard([&mmcss_task]() {
+        if (mmcss_task) {
+          AvRevertMmThreadCharacteristics(mmcss_task);
+        }
+      });
+
+      audio_client_t client;
+      audio_capture_t capture;
+      handle_t data_event;
+
+      HRESULT status = E_FAIL;
+      do {
+        auto *handler = new activate_completion_handler_t(async_done_event);
+
+        AUDIOCLIENT_ACTIVATION_PARAMS activation_params {};
+        activation_params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+        activation_params.loopback_union.ProcessLoopbackParams.TargetProcessId = process_id;
+        activation_params.loopback_union.ProcessLoopbackParams.ProcessLoopbackMode =
+            PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+
+        // The async activation entry point takes a PROPVARIANT; process loopback
+        // parameters are passed as a VT_BLOB carrying the activation struct.
+        PROPVARIANT activation_property {};
+        PropVariantInit(&activation_property);
+        activation_property.vt = VT_BLOB;
+        activation_property.blob.cbSize = sizeof(activation_params);
+        activation_property.blob.pBlobData = reinterpret_cast<BYTE *>(&activation_params);
+
+        IActivateAudioInterfaceAsyncOperation *operation = nullptr;
+        status = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+                                             __uuidof(IAudioClient), &activation_property, handler, &operation);
+        // No PropVariantClear: the blob points at stack memory and must not be freed.
+        if (operation) {
+          operation->Release();
+        }
+        if (FAILED(status)) {
+          handler->Release();
           break;
         }
 
-        pipe.read(read_buf.data(), static_cast<std::streamsize>(read_buf.size()));
-        auto got = pipe.gcount();
-        if (got <= 0) {
+        HANDLE activation_handles[] {async_done_event, cancel_event};
+        auto activation_wait = WaitForMultipleObjects(2, activation_handles, FALSE, 10000);
+        if (activation_wait != WAIT_OBJECT_0) {
+          handler->Release();
+          status = E_ABORT;
           break;
         }
 
-        const auto *bytes = reinterpret_cast<const std::uint8_t *>(read_buf.data());
-        pending.insert(pending.end(), bytes, bytes + got);
+        IUnknown *activated = nullptr;
+        status = handler->result(&activated);
+        handler->Release();
+        if (FAILED(status) || !activated) {
+          break;
+        }
+        status = activated->QueryInterface(__uuidof(IAudioClient), reinterpret_cast<void **>(&client));
+        activated->Release();
+        if (FAILED(status)) {
+          break;
+        }
 
-        auto complete = pending.size() / sizeof(float);
-        if (complete > 0) {
-          auto aligned = complete * sizeof(float);
-          std::vector<float> floats(complete);
-          std::memcpy(floats.data(), pending.data(), aligned);
-          pending.erase(pending.begin(), pending.begin() + aligned);
+        // Prefer 48 kHz stereo float32 (the pipeline's contract); fall back to
+        // the endpoint mix format and normalise in append_frames() if rejected.
+        auto wanted = create_waveformat(sample_format_e::f32, 2, waveformat_mask_stereo);
+        const WAVEFORMATEX *format = &wanted.Format;
+        wave_format_t mix_format;
 
-          {
-            std::lock_guard lock(mutex);
-            sample_buf.insert(sample_buf.end(), floats.begin(), floats.end());
-            if (sample_buf.size() > max_buf) {
-              auto drop = sample_buf.size() - max_buf;
-              sample_buf.erase(sample_buf.begin(), sample_buf.begin() + drop);
-            }
+        status = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                    1'000'000, 0, format, nullptr);
+        if (status == AUDCLNT_E_UNSUPPORTED_FORMAT || status == E_INVALIDARG) {
+          status = client->GetMixFormat(&mix_format);
+          if (SUCCEEDED(status)) {
+            format = mix_format.get();
+            status = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                        1'000'000, 0, format, nullptr);
           }
-          cv.notify_all();
         }
+        if (FAILED(status)) {
+          break;
+        }
+
+        data_event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+        if (!data_event) {
+          status = HRESULT_FROM_WIN32(GetLastError());
+          break;
+        }
+
+        status = client->SetEventHandle(data_event.get());
+        if (FAILED(status)) {
+          break;
+        }
+        status = client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void **>(&capture));
+        if (FAILED(status)) {
+          break;
+        }
+        status = client->Start();
+        if (FAILED(status)) {
+          break;
+        }
+
+        activate_status = S_OK;
+        SetEvent(activated_event);
+
+        pump_capture(capture.get(), format, data_event.get(), token);
+
+        client->Stop();
+        status = S_OK;
+      } while (false);
+
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Process audio capture failed for pid ["sv << process_id << "]: [0x"sv
+                         << util::hex(static_cast<std::uint32_t>(status)).to_string_view() << ']';
+        activate_status = status;
+        SetEvent(activated_event);
       }
 
       {
@@ -1117,26 +1431,135 @@ namespace platf::audio {
     }
 
     /**
-     * @brief Locate the proctap executable next to Sunshine or on the system PATH.
+     * @brief Drain captured WASAPI packets into sample_buf until shutdown.
      *
-     * @return Full path to proctap.exe when found, or an empty optional.
+     * @param capture Active IAudioCaptureClient.
+     * @param format Format of the captured packets (must be float32).
+     * @param data_event Event signalled by WASAPI when packets are available.
+     * @param token Stop token used to request an early exit.
      */
-    static std::optional<std::filesystem::path> find_proctap() {
-      wchar_t exe_path_buf[MAX_PATH];
-      auto chars = GetModuleFileNameW(nullptr, exe_path_buf, MAX_PATH);
-      if (chars > 0 && chars < MAX_PATH) {
-        auto candidate = std::filesystem::path(exe_path_buf).parent_path() / L"proctap.exe";
-        if (std::filesystem::exists(candidate)) {
-          return candidate;
+    void pump_capture(IAudioCaptureClient *capture, const WAVEFORMATEX *format, HANDLE data_event,
+                      std::stop_token token) {
+      const auto *ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE *>(format);
+      const auto is_float =
+          format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+          (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+      if (!is_float || format->wBitsPerSample != 32) {
+        BOOST_LOG(error) << "Process audio capture needs float32 samples; capture stream unsupported"sv;
+        return;
+      }
+
+      const auto source_channels = format->nChannels;
+      const auto source_rate = format->nSamplesPerSec;
+
+      HANDLE wait_handles[] {data_event, cancel_event};
+      while (!token.stop_requested()) {
+        auto wait_result = WaitForMultipleObjects(2, wait_handles, FALSE, 200);
+        if (wait_result == WAIT_OBJECT_0 + 1) {
+          break;
+        }
+
+        UINT32 packet_length = 0;
+        while (SUCCEEDED(capture->GetNextPacketSize(&packet_length)) && packet_length > 0) {
+          BYTE *data = nullptr;
+          UINT32 frames = 0;
+          DWORD flags = 0;
+          if (FAILED(capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) {
+            return;
+          }
+
+          if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+            append_silence(frames, source_rate);
+          } else {
+            append_frames(reinterpret_cast<const float *>(data), frames, source_channels, source_rate);
+          }
+
+          capture->ReleaseBuffer(frames);
         }
       }
+    }
 
-      auto found = bp::search_path("proctap.exe");
-      if (!found.empty()) {
-        return std::filesystem::path(found.native());
+    /**
+     * @brief Downmix captured float frames to stereo and append them.
+     *
+     * Windows channel ordering places front-left/front-right first, so for
+     * multi-channel streams only the first two channels are used; mono is
+     * duplicated.  A non-48 kHz source is linearly resampled.
+     *
+     * @param input Interleaved float samples from IAudioCaptureClient.
+     * @param frames Number of source frames in @p input.
+     * @param source_channels Channel count of the captured stream.
+     * @param source_rate Sample rate of the captured stream.
+     */
+    void append_frames(const float *input, UINT32 frames, WORD source_channels, DWORD source_rate) {
+      std::vector<float> stereo;
+      stereo.reserve(static_cast<std::size_t>(frames) * 2);
+      for (UINT32 frame = 0; frame < frames; ++frame) {
+        auto left = input[static_cast<std::size_t>(frame) * source_channels];
+        auto right = source_channels > 1 ? input[static_cast<std::size_t>(frame) * source_channels + 1] : left;
+        stereo.push_back(left);
+        stereo.push_back(right);
       }
 
-      return std::nullopt;
+      if (source_rate != SAMPLE_RATE) {
+        stereo = resample_stereo(stereo, source_rate);
+      }
+      push_samples(stereo);
+    }
+
+    /**
+     * @brief Append silence for a silent WASAPI packet.
+     * @param frames Number of source frames of silence.
+     * @param source_rate Source rate used to size the resampled output.
+     */
+    void append_silence(UINT32 frames, DWORD source_rate) {
+      auto out_frames = static_cast<std::size_t>(frames);
+      if (source_rate != SAMPLE_RATE) {
+        out_frames = static_cast<std::size_t>(static_cast<double>(frames) * SAMPLE_RATE / source_rate);
+      }
+      std::vector<float> silence(out_frames * 2, 0.0f);
+      push_samples(silence);
+    }
+
+    /**
+     * @brief Linearly resample interleaved stereo frames to 48 kHz.
+     *
+     * Only used when the endpoint mix format rejects 48 kHz directly; the
+     * default mix format is 48 kHz on virtually all systems.
+     *
+     * @param input Interleaved stereo frames at @p source_rate.
+     * @param source_rate Source sample rate in Hz.
+     * @return Resampled interleaved stereo frames.
+     */
+    static std::vector<float> resample_stereo(const std::vector<float> &input, DWORD source_rate) {
+      auto input_frames = input.size() / 2;
+      auto output_frames =
+          static_cast<std::size_t>(static_cast<double>(input_frames) * SAMPLE_RATE / source_rate);
+      std::vector<float> output(output_frames * 2);
+      for (std::size_t out = 0; out < output_frames; ++out) {
+        auto position = static_cast<double>(out) * source_rate / SAMPLE_RATE;
+        auto index = static_cast<std::size_t>(position);
+        auto fraction = static_cast<float>(position - static_cast<double>(index));
+        auto next = index + 1 < input_frames ? index + 1 : index;
+        output[out * 2] = input[index * 2] + (input[next * 2] - input[index * 2]) * fraction;
+        output[out * 2 + 1] =
+            input[index * 2 + 1] + (input[next * 2 + 1] - input[index * 2 + 1]) * fraction;
+      }
+      return output;
+    }
+
+    /**
+     * @brief Append stereo frames to the shared buffer, capping its length.
+     * @param samples Interleaved stereo floats to append.
+     */
+    void push_samples(const std::vector<float> &samples) {
+      std::lock_guard lock(mutex);
+      sample_buf.insert(sample_buf.end(), samples.begin(), samples.end());
+      if (sample_buf.size() > max_buf) {
+        sample_buf.erase(sample_buf.begin(),
+                         sample_buf.begin() + static_cast<std::ptrdiff_t>(sample_buf.size() - max_buf));
+      }
+      cv.notify_all();
     }
   };
 
@@ -1267,14 +1690,22 @@ namespace platf::audio {
      * @return Microphone capture object for the requested audio layout.
      */
     std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, [[maybe_unused]] bool host_audio_enabled) override {
-      // When a specific process is targeted, prefer isolated proctap capture.
+      // When a specific process is targeted, prefer in-process WASAPI Process
+      // Loopback so only that process' render output is streamed.
       if (config::video.capture_process != 0) {
+        auto target_pid = config::video.capture_process;
         auto proc_mic = std::make_unique<mic_proc_t>();
-        if (proc_mic->init(config::video.capture_process, sample_rate, frame_size, channels, continuous_audio) == 0) {
-          BOOST_LOG(info) << "Capturing audio from process ["sv << config::video.capture_process << ']';
+        if (proc_mic->init(target_pid, sample_rate, frame_size, channels, continuous_audio) == 0) {
+          clear_proc_capture_backoff();
+          BOOST_LOG(info) << "Capturing audio from process ["sv << target_pid << ']';
           return proc_mic;
         }
-        BOOST_LOG(warning) << "Couldn't start proctap process capture; falling back to WASAPI"sv;
+        // Stay on desktop loopback for now; the WASAPI microphone re-checks
+        // the gate after the backoff instead of re-activating in a loop.
+        arm_proc_capture_backoff(target_pid);
+        BOOST_LOG(warning) << "Couldn't start Process Loopback capture; falling back to desktop WASAPI"sv;
+      } else {
+        clear_proc_capture_backoff();
       }
 
       auto mic = std::make_unique<mic_wasapi_t>();
@@ -1811,7 +2242,29 @@ namespace platf::audio {
     }
 
     /**
-     * @brief Exercise the mic_proc_t upmix path without launching proctap.
+     * @brief Return the virtual device identifier used for process loopback activation.
+     *
+     * The identifier must be passed verbatim to ActivateAudioInterfaceAsync();
+     * appending a GUID or path suffix makes activation fail with
+     * HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND).
+     *
+     * @return The null-terminated virtual device identifier.
+     */
+    const wchar_t *process_loopback_device_path() {
+      return VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK;
+    }
+
+    /**
+     * @brief Return the byte size of the process loopback activation parameter blob.
+     *
+     * @return `sizeof(AUDIOCLIENT_ACTIVATION_PARAMS)` for the current toolchain ABI.
+     */
+    std::size_t process_loopback_params_size() {
+      return sizeof(AUDIOCLIENT_ACTIVATION_PARAMS);
+    }
+
+    /**
+     * @brief Exercise the mic_proc_t upmix path without activating WASAPI.
      *
      * Constructs a mic_proc_t, injects stereo samples into its buffer, and
      * invokes sample() to verify the 2-to-N channel conversion.
@@ -1939,6 +2392,67 @@ namespace platf::audio {
       output.resize(2);
       auto result = mic.sample(output);
       config::video.capture_process = previous_process;
+      return result;
+    }
+
+    /**
+     * @brief Verify the gate stays closed in desktop mode (capture_process == 0),
+     *        even with a backoff armed.
+     * @return The gate decision; must be false.
+     */
+    bool process_switch_gate_closed_for_desktop() {
+      auto previous_process = std::exchange(config::video.capture_process, 0u);
+      arm_proc_capture_backoff(900u);
+      auto open = process_capture_switch_pending();
+      config::video.capture_process = previous_process;
+      clear_proc_capture_backoff();
+      return open;
+    }
+
+    /**
+     * @brief Verify a fresh backoff suppresses retries for the same target PID.
+     * @return The gate decision; must be false.
+     */
+    bool process_switch_backoff_blocks_same_pid() {
+      auto previous_process = std::exchange(config::video.capture_process, 901u);
+      arm_proc_capture_backoff(901u);
+      auto open = process_capture_switch_pending();
+      config::video.capture_process = previous_process;
+      clear_proc_capture_backoff();
+      return open;
+    }
+
+    /**
+     * @brief Verify selecting a different target PID bypasses an armed backoff.
+     * @return The gate decision; must be true.
+     */
+    bool process_switch_backoff_allows_different_pid() {
+      auto previous_process = std::exchange(config::video.capture_process, 902u);
+      arm_proc_capture_backoff(901u);
+      auto open = process_capture_switch_pending();
+      config::video.capture_process = previous_process;
+      clear_proc_capture_backoff();
+      return open;
+    }
+
+    /**
+     * @brief Verify that mic_wasapi_t requests reinitialization when a process
+     *        target is selected mid-session.
+     *
+     * Temporarily points config::video.capture_process at a fake PID and invokes
+     * the WASAPI microphone's sample() without any audio hardware; the switch
+     * gate must make it return capture_e::reinit before touching WASAPI.
+     *
+     * @return Capture result from sample().
+     */
+    capture_e wasapi_mic_process_switch() {
+      auto previous_process = std::exchange(config::video.capture_process, 321u);
+      clear_proc_capture_backoff();
+      mic_wasapi_t microphone;
+      std::vector<float> sample(1);
+      auto result = microphone.sample(sample);
+      config::video.capture_process = previous_process;
+      clear_proc_capture_backoff();
       return result;
     }
   }  // namespace tests

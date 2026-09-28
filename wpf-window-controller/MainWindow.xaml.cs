@@ -67,10 +67,13 @@ namespace SunshineWindowController
         }
 
         /// <summary>
-        /// 定时刷新窗口列表：用户正按住鼠标交互或焦点伪造操作进行中时跳过本轮。
+        /// 定时刷新窗口列表：窗口不活跃（失去焦点或最小化）、用户正按住鼠标交互、
+        /// 或焦点伪造操作进行中时跳过本轮。
         /// </summary>
         private void RefreshTimer_Tick(object sender, EventArgs e)
         {
+            if (!IsActive)
+                return;
             if (System.Windows.Input.Mouse.LeftButton == System.Windows.Input.MouseButtonState.Pressed)
                 return;
             if (_spoofBusy)

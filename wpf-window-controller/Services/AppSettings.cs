@@ -32,14 +32,14 @@ namespace SunshineWindowController.Services
         /// <summary>开启窗口子类化（用于伪聚焦和 WM_INPUT 屏蔽），默认开启</summary>
         public bool EnableSubclass { get; set; } = true;
 
-        /// <summary>屏蔽键鼠状态 API（GetKeyState / GetAsyncKeyState / GetKeyboardState），默认关闭</summary>
-        public bool BlockPollingApis { get; set; } = false;
+        /// <summary>屏蔽键鼠状态 API（GetKeyState / GetAsyncKeyState / GetKeyboardState），默认开启</summary>
+        public bool BlockPollingApis { get; set; } = true;
 
-        /// <summary>屏蔽 WM_INPUT（需要开启窗口子类化），默认关闭</summary>
-        public bool BlockWmInput { get; set; } = false;
+        /// <summary>屏蔽 WM_INPUT（需要开启窗口子类化），默认开启</summary>
+        public bool BlockWmInput { get; set; } = true;
 
-        /// <summary>屏蔽 RawInput 相关 API（GetRawInputData/GetRawInputBuffer，与 WM_INPUT 功能相同但不需要子类化），默认关闭</summary>
-        public bool BlockRawInputApis { get; set; } = false;
+        /// <summary>屏蔽 RawInput 相关 API（GetRawInputData/GetRawInputBuffer，与 WM_INPUT 功能相同但不需要子类化），默认开启</summary>
+        public bool BlockRawInputApis { get; set; } = true;
 
         /// <summary>ShowCursor 直通控制点（拦截隐藏会使游戏显示计数失同步而死循环），默认开启</summary>
         public bool BlockCursorHide { get; set; } = true;

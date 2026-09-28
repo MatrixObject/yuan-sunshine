@@ -306,18 +306,18 @@
                                     <TextBlock Text="开启子类化（用于伪聚焦和 WM_INPUT 屏蔽）"/>
                                 </CheckBox>
                                 <CheckBox x:Name="BlockWmInputCheck" Tag="BlockWmInput"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
                                           Checked="FocusOption_Changed" Unchecked="FocusOption_Changed">
                                     <TextBlock Text="屏蔽 WM_INPUT（需要开启子类化）"/>
                                 </CheckBox>
                                 <CheckBox x:Name="BlockRawApisCheck" Tag="BlockRawInputApis"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
                                           Checked="FocusOption_Changed" Unchecked="FocusOption_Changed">
                                     <TextBlock Text="屏蔽 RawInput 相关API（与 WM_INPUT 功能相同，但不需要子类化）"/>
                                 </CheckBox>
                                 <CheckBox x:Name="BlockPollApisCheck" Tag="BlockPollingApis"
                                           Content="屏蔽 API GetKeyState GetAsyncKeyState"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
                                           Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
                                 <CheckBox x:Name="BlockCursorHideCheck" Tag="BlockCursorHide"
                                           Content="阻止鼠标隐藏"

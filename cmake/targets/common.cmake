@@ -147,11 +147,3 @@ if("${BUILD_TYPE}" STREQUAL "XDEBUG")
 else()
     add_definitions(-DNDEBUG)
 endif()
-
-# proctap: process-isolated audio capture verification utility
-add_executable(proctap "${CMAKE_SOURCE_DIR}/tools/proctap.cpp")
-target_link_libraries(proctap
-        ${CMAKE_THREAD_LIBS_INIT}
-        ${PLATFORM_LIBRARIES})
-target_compile_options(proctap PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
-install(TARGETS proctap RUNTIME DESTINATION "." COMPONENT application)

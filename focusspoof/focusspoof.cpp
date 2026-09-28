@@ -27,13 +27,13 @@
  *   EnableSubclass        (default 1) - subclass the target window; powers
  *                                     both the activation spoofing and the
  *                                     WM_INPUT drop.
- *   BlockPollingApis      (default 0) - GetKeyState / GetAsyncKeyState /
+ *   BlockPollingApis      (default 1) - GetKeyState / GetAsyncKeyState /
  *                                     GetKeyboardState report nothing
  *                                     pressed.
- *   BlockWmInput          (default 0) - real WM_INPUT is dropped in the
+ *   BlockWmInput          (default 1) - real WM_INPUT is dropped in the
  *                                     subclassed wndproc (needs
  *                                     EnableSubclass).
- *   BlockRawInputApis     (default 0) - GetRawInputData /
+ *   BlockRawInputApis     (default 1) - GetRawInputData /
  *                                     GetRawInputBuffer answer no data
  *                                     (no subclass needed).
  *   BlockCursorHide       (default 1) - arms the ShowCursor pass-through
@@ -1199,33 +1199,33 @@ static ULONG_PTR FileUintPtr(const char* name, ULONG_PTR def) {
 /**
  * @brief Whether polled key/mouse state is zeroed (GetAsyncKeyState /
  * GetKeyState / GetKeyboardState). Armed only by the explicit
- * "BlockPollingApis" switch; defaults to OFF. XInput gamepad input is never
+ * "BlockPollingApis" switch; defaults to ON. XInput gamepad input is never
  * affected.
  * @return True when the poll hooks should be installed.
  */
 static bool PollBlockEnabled(void) {
-  return FileDword("BlockPollingApis", 0) != 0;
+  return FileDword("BlockPollingApis", 1) != 0;
 }
 
 /**
  * @brief Whether real WM_INPUT messages are dropped in the subclassed
  * wndproc. Armed only by the explicit "BlockWmInput" switch; defaults to
- * OFF. Only has an effect when the window subclass is installed
+ * ON. Only has an effect when the window subclass is installed
  * (EnableSubclass=1), because the drop happens inside SwallowProc.
  * @return True when real WM_INPUT should be swallowed.
  */
 static bool WmInputBlockEnabled(void) {
-  return FileDword("BlockWmInput", 0) != 0;
+  return FileDword("BlockWmInput", 1) != 0;
 }
 
 /**
  * @brief Whether the raw-API reads (GetRawInputData / GetRawInputBuffer) are
  * zeroed. Armed only by the explicit "BlockRawInputApis" switch; defaults to
- * OFF. Works with or without a window subclass.
+ * ON. Works with or without a window subclass.
  * @return True when the raw-API hooks should be installed.
  */
 static bool RawApisBlockEnabled(void) {
-  return FileDword("BlockRawInputApis", 0) != 0;
+  return FileDword("BlockRawInputApis", 1) != 0;
 }
 
 /**
