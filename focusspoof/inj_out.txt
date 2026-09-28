@@ -1,1 +1,1 @@
-Injected. LoadLibrary handle = 0x5FE10000 (PID 14492)
+Injected. LoadLibrary handle = 0x86C80000 (PID 23168)

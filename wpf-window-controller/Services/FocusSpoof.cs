@@ -12,7 +12,7 @@ namespace SunshineWindowController.Services
     ///
     /// 注入器（injectedll.exe）由本类启动，DLL 行为受配置文件控制。
     /// 配置文件路径：%APPDATA%\SunshineWindowController\focus_options.txt
-    /// 格式：每行一个键值对，如 "BlockKeyboardMouse=1"
+    /// 格式：每行一个键值对，如 "BlockPollingApis=1"
     /// </summary>
     internal static class FocusSpoof
     {

@@ -22,6 +22,12 @@ namespace SunshineWindowController
         private bool _suppressSelection;
         private int _refreshGeneration;
 
+        /// <summary>定时刷新窗口列表的计时器（每 3 秒一次）。</summary>
+        private readonly System.Windows.Threading.DispatcherTimer _refreshTimer;
+
+        /// <summary>焦点伪造注入/开关操作进行中标记，期间暂停定时刷新。</summary>
+        private bool _spoofBusy;
+
         /// <summary>每个进程当前的 hook 状态（pid -> hooked）。用于在窗口列表刷新后恢复按钮文本。</summary>
         private readonly System.Collections.Generic.Dictionary<uint, bool> _hookStateByPid =
             new System.Collections.Generic.Dictionary<uint, bool>();
@@ -50,6 +56,35 @@ namespace SunshineWindowController
 
             // 初始刷新窗口列表
             _ = RefreshTargetsAsync();
+
+            // 定时刷新窗口列表
+            _refreshTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(3)
+            };
+            _refreshTimer.Tick += RefreshTimer_Tick;
+            _refreshTimer.Start();
+        }
+
+        /// <summary>
+        /// 定时刷新窗口列表：用户正按住鼠标交互或焦点伪造操作进行中时跳过本轮。
+        /// </summary>
+        private void RefreshTimer_Tick(object sender, EventArgs e)
+        {
+            if (System.Windows.Input.Mouse.LeftButton == System.Windows.Input.MouseButtonState.Pressed)
+                return;
+            if (_spoofBusy)
+                return;
+            _ = RefreshTargetsAsync();
+        }
+
+        /// <summary>
+        /// 窗口关闭时停止定时刷新计时器。
+        /// </summary>
+        protected override void OnClosed(EventArgs e)
+        {
+            _refreshTimer?.Stop();
+            base.OnClosed(e);
         }
 
         /// <summary>
@@ -57,11 +92,11 @@ namespace SunshineWindowController
         /// </summary>
         private void LoadFocusOptions()
         {
-            BlockKbMouseCheck.IsChecked = FocusSpoof.GetOption("BlockKeyboardMouse", 0) != 0;
-            RawInputCheck.IsChecked = FocusSpoof.GetOption("DisableRawInput", 0) != 0;  // 默认不禁用（开钩子）
-            BlockLegacyMessagesCheck.IsChecked = FocusSpoof.GetOption("BlockLegacyMessages", 0) != 0;  // 默认关
             SuspendOnPatchCheck.IsChecked = FocusSpoof.GetOption("SuspendThreadsOnPatch", _settings.SuspendThreadsOnPatch ? 1 : 0) != 0;
             EnableSubclassCheck.IsChecked = FocusSpoof.GetOption("EnableSubclass", _settings.EnableSubclass ? 1 : 0) != 0;
+            BlockPollApisCheck.IsChecked = FocusSpoof.GetOption("BlockPollingApis", _settings.BlockPollingApis ? 1 : 0) != 0;
+            BlockWmInputCheck.IsChecked = FocusSpoof.GetOption("BlockWmInput", _settings.BlockWmInput ? 1 : 0) != 0;
+            BlockRawApisCheck.IsChecked = FocusSpoof.GetOption("BlockRawInputApis", _settings.BlockRawInputApis ? 1 : 0) != 0;
             BlockCursorHideCheck.IsChecked = FocusSpoof.GetOption("BlockCursorHide", _settings.BlockCursorHide ? 1 : 0) != 0;
             BlockCursorLockCheck.IsChecked = FocusSpoof.GetOption("BlockCursorLock", _settings.BlockCursorLock ? 1 : 0) != 0;
             DisableAllCheck.IsChecked = FocusSpoof.GetOption("DisableFocusSpoof", _settings.DisableAll ? 1 : 0) != 0;
@@ -82,11 +117,11 @@ namespace SunshineWindowController
                 {
                     var lines = new System.Collections.Generic.List<string>
                     {
-                        "BlockKeyboardMouse=" + (_settings.BlockKeyboardMouse ? 1 : 0),
-                        "DisableRawInput=" + (_settings.DisableRawInput ? 1 : 0),
-                        "BlockLegacyMessages=" + (_settings.BlockLegacyMessages ? 1 : 0),
                         "SuspendThreadsOnPatch=" + (_settings.SuspendThreadsOnPatch ? 1 : 0),
                         "EnableSubclass=" + (_settings.EnableSubclass ? 1 : 0),
+                        "BlockPollingApis=" + (_settings.BlockPollingApis ? 1 : 0),
+                        "BlockWmInput=" + (_settings.BlockWmInput ? 1 : 0),
+                        "BlockRawInputApis=" + (_settings.BlockRawInputApis ? 1 : 0),
                         "BlockCursorHide=" + (_settings.BlockCursorHide ? 1 : 0),
                         "BlockCursorLock=" + (_settings.BlockCursorLock ? 1 : 0),
                         "DisableFocusSpoof=" + (_settings.DisableAll ? 1 : 0),
@@ -124,20 +159,20 @@ namespace SunshineWindowController
             var value = box.IsChecked == true;
             switch (optionName)
             {
-                case "BlockKeyboardMouse":
-                    _settings.BlockKeyboardMouse = value;
-                    break;
-                case "DisableRawInput":
-                    _settings.DisableRawInput = value;
-                    break;
-                case "BlockLegacyMessages":
-                    _settings.BlockLegacyMessages = value;
-                    break;
                 case "SuspendThreadsOnPatch":
                     _settings.SuspendThreadsOnPatch = value;
                     break;
                 case "EnableSubclass":
                     _settings.EnableSubclass = value;
+                    break;
+                case "BlockPollingApis":
+                    _settings.BlockPollingApis = value;
+                    break;
+                case "BlockWmInput":
+                    _settings.BlockWmInput = value;
+                    break;
+                case "BlockRawInputApis":
+                    _settings.BlockRawInputApis = value;
                     break;
                 case "BlockCursorHide":
                     _settings.BlockCursorHide = value;
@@ -206,9 +241,17 @@ namespace SunshineWindowController
         private async void RefreshButton_Click(object sender, RoutedEventArgs e)
         {
             _suppressSelection = true;
-            await SaveSettingsAsync();
-            await RefreshTargetsAsync();
-            _suppressSelection = false;
+            RefreshButton.IsEnabled = false;
+            try
+            {
+                await SaveSettingsAsync();
+                await RefreshTargetsAsync();
+            }
+            finally
+            {
+                RefreshButton.IsEnabled = true;
+                _suppressSelection = false;
+            }
         }
 
         private async Task SaveSettingsAsync()
@@ -216,9 +259,19 @@ namespace SunshineWindowController
             _settings.BaseUrl = BaseUrlBox.Text.Trim();
             _settings.Username = UsernameBox.Text.Trim();
             _settings.Password = PasswordBox.Password;
-            _settings.SunshineExePath = SunshinePathBox.Text.Trim();
+            // 记录解析后的绝对路径，而不是原始输入（相对路径 ./sunshine.exe 无法跨进程/换目录复用）。
+            var rawPath = SunshinePathBox.Text.Trim();
+            _settings.SunshineExePath = SunshineService.ResolveExePath(rawPath) ?? rawPath;
             _settings.Save();
             await Task.Yield();
+        }
+
+        /// <summary>
+        /// 编辑框失去焦点时立即记录 sunshine.exe 路径，避免重启后回退为默认值。
+        /// </summary>
+        private async void SunshinePathBox_LostFocus(object sender, RoutedEventArgs e)
+        {
+            await SaveSettingsAsync();
         }
 
         private async void LaunchButton_Click(object sender, RoutedEventArgs e)
@@ -247,6 +300,9 @@ namespace SunshineWindowController
                 SetStatus("已启动 Sunshine，等待 API 就绪...");
             }
 
+            // 启动成功即记录解析后的绝对路径。
+            await SaveSettingsAsync();
+
             if (await service.WaitReadyAsync(TimeSpan.FromSeconds(15)))
             {
                 SetStatus("Sunshine API 已就绪。");
@@ -264,7 +320,6 @@ namespace SunshineWindowController
             if (_isRefreshing)
                 return;
             _isRefreshing = true;
-            RefreshButton.IsEnabled = false;
             var generation = ++_refreshGeneration;
 
             try
@@ -305,10 +360,25 @@ namespace SunshineWindowController
                     return items;
                 });
 
+                // 重建列表前记住当前选中项，重建后恢复选中（不触发切换录制目标）。
+                var selected = TargetList.SelectedItem as CaptureTarget;
+
                 Targets.Clear();
                 foreach (var item in result)
                 {
                     Targets.Add(item);
+                }
+
+                if (selected != null)
+                {
+                    _suppressSelection = true;
+                    CaptureTarget restored = selected.IsDesktop
+                        ? result.FirstOrDefault(t => t.IsDesktop)
+                        : result.FirstOrDefault(t => t.Pid == selected.Pid && t.Hwnd == selected.Hwnd)
+                          ?? result.FirstOrDefault(t => t.Pid == selected.Pid);
+                    if (restored != null)
+                        TargetList.SelectedItem = restored;
+                    _suppressSelection = false;
                 }
 
                 TargetCountText.Text = "共找到 " + (result.Count - 1) + " 个窗口，加上桌面。";
@@ -320,7 +390,6 @@ namespace SunshineWindowController
             finally
             {
                 _isRefreshing = false;
-                RefreshButton.IsEnabled = true;
             }
         }
 
@@ -400,6 +469,9 @@ namespace SunshineWindowController
                 }
             }
 
+            // 本次用到的 sunshine.exe 路径要持久化（已解析为绝对路径）。
+            await SaveSettingsAsync();
+
             SetStatus("切换到：" + target.Title + (target.IsDesktop ? "" : " (PID " + target.Pid + ")"));
 
             try
@@ -463,8 +535,12 @@ namespace SunshineWindowController
                 return;
 
             button.IsEnabled = false;
+            _spoofBusy = true;
             try
             {
+                // 记录本次使用的 sunshine.exe 路径。
+                await SaveSettingsAsync();
+
                 if (target.IsFocusSpoofOn)
                 {
                     SetStatus("正在关闭窗口伪聚焦：" + target.Title + " ...");
@@ -510,6 +586,7 @@ namespace SunshineWindowController
             finally
             {
                 button.IsEnabled = true;
+                _spoofBusy = false;
             }
         }
 
@@ -520,11 +597,11 @@ namespace SunshineWindowController
         {
             WriteAllFocusOptions();
 
-            _settings.BlockKeyboardMouse = BlockKbMouseCheck.IsChecked == true;
-            _settings.DisableRawInput = RawInputCheck.IsChecked == true;
-            _settings.BlockLegacyMessages = BlockLegacyMessagesCheck.IsChecked == true;
             _settings.SuspendThreadsOnPatch = SuspendOnPatchCheck.IsChecked == true;
             _settings.EnableSubclass = EnableSubclassCheck.IsChecked == true;
+            _settings.BlockPollingApis = BlockPollApisCheck.IsChecked == true;
+            _settings.BlockWmInput = BlockWmInputCheck.IsChecked == true;
+            _settings.BlockRawInputApis = BlockRawApisCheck.IsChecked == true;
             _settings.BlockCursorHide = BlockCursorHideCheck.IsChecked == true;
             _settings.BlockCursorLock = BlockCursorLockCheck.IsChecked == true;
             _settings.DisableAll = DisableAllCheck.IsChecked == true;
@@ -547,11 +624,11 @@ namespace SunshineWindowController
         /// </summary>
         private void WriteAllFocusOptions()
         {
-            FocusSpoof.SetOption("BlockKeyboardMouse", BlockKbMouseCheck.IsChecked == true ? 1 : 0);
-            FocusSpoof.SetOption("DisableRawInput", RawInputCheck.IsChecked == true ? 1 : 0);
-            FocusSpoof.SetOption("BlockLegacyMessages", BlockLegacyMessagesCheck.IsChecked == true ? 1 : 0);
             FocusSpoof.SetOption("SuspendThreadsOnPatch", SuspendOnPatchCheck.IsChecked == true ? 1 : 0);
             FocusSpoof.SetOption("EnableSubclass", EnableSubclassCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("BlockPollingApis", BlockPollApisCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("BlockWmInput", BlockWmInputCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("BlockRawInputApis", BlockRawApisCheck.IsChecked == true ? 1 : 0);
             FocusSpoof.SetOption("BlockCursorHide", BlockCursorHideCheck.IsChecked == true ? 1 : 0);
             FocusSpoof.SetOption("BlockCursorLock", BlockCursorLockCheck.IsChecked == true ? 1 : 0);
             FocusSpoof.SetOption("DisableFocusSpoof", DisableAllCheck.IsChecked == true ? 1 : 0);

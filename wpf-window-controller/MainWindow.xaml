@@ -195,7 +195,7 @@
                                         <Button Grid.Column="2" x:Name="FocusSpoofButton"
                                                 Content="{Binding FocusButtonText}"
                                                 Click="FocusSpoofButton_Click"
-                                                Padding="12,7" Margin="12,0,0,0" VerticalAlignment="Center"
+                                                Padding="12,14" Margin="12,0,0,0" VerticalAlignment="Center"
                                                 Foreground="White" BorderThickness="0"
                                                 ToolTip="为该窗口注入焦点伪造 DLL，使其在后台也保持渲染与手柄响应。">
                                             <Button.Style>
@@ -260,6 +260,7 @@
                                     <TextBlock Grid.Column="0" Text="sunshine.exe 路径：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
                                     <ComboBox Grid.Column="1" x:Name="SunshinePathBox" Margin="8,0,0,0"
                                               IsEditable="True" Style="{StaticResource DarkEditableComboBox}"
+                                              LostFocus="SunshinePathBox_LostFocus"
                                               ToolTip="默认相对路径 ./sunshine.exe（即本程序所在目录）。请使用 YuanSunshine 构建版本。"/>
                                 </Grid>
                                 <TextBlock Text="默认使用相对路径 ./sunshine.exe（即本程序所在目录）。请务必使用 YuanSunshine 构建版本的 sunshine.exe。"
@@ -294,32 +295,36 @@
                         <TextBlock Text="焦点伪造选项" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
                         <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
                             <StackPanel>
-                                <CheckBox x:Name="BlockKbMouseCheck" Tag="BlockKeyboardMouse"
-                                          Content="屏蔽键鼠输入（XInput 手柄始终有效）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="RawInputCheck" Tag="DisableRawInput"
-                                          Content="禁用 Raw Input 钩子（默认关——屏蔽键鼠靠它，开着才生效）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
-                                <CheckBox x:Name="BlockLegacyMessagesCheck" Tag="BlockLegacyMessages"
-                                          Content="窗口过程层屏蔽（需子类化，re9 上默认关以避免闪退）"
-                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
-                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
                                 <CheckBox x:Name="SuspendOnPatchCheck" Tag="SuspendThreadsOnPatch"
                                           Content="打补丁时冻结线程"
                                           Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
                                           Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
                                 <CheckBox x:Name="EnableSubclassCheck" Tag="EnableSubclass"
-                                          Content="启用窗口子类化（旧方式，多数游戏建议关闭）"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed">
+                                    <!-- TextBlock 承载文本：CheckBox 的字符串 Content 会把 "_" 当成助记键标记而隐藏（WM_INPUT 显示成 WMINPUT） -->
+                                    <TextBlock Text="开启子类化（用于伪聚焦和 WM_INPUT 屏蔽）"/>
+                                </CheckBox>
+                                <CheckBox x:Name="BlockWmInputCheck" Tag="BlockWmInput"
+                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed">
+                                    <TextBlock Text="屏蔽 WM_INPUT（需要开启子类化）"/>
+                                </CheckBox>
+                                <CheckBox x:Name="BlockRawApisCheck" Tag="BlockRawInputApis"
+                                          Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed">
+                                    <TextBlock Text="屏蔽 RawInput 相关API（与 WM_INPUT 功能相同，但不需要子类化）"/>
+                                </CheckBox>
+                                <CheckBox x:Name="BlockPollApisCheck" Tag="BlockPollingApis"
+                                          Content="屏蔽 API GetKeyState GetAsyncKeyState"
                                           Foreground="#FFCFCFCF" IsChecked="False" Margin="0,0,0,6"
                                           Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
                                 <CheckBox x:Name="BlockCursorHideCheck" Tag="BlockCursorHide"
-                                          Content="阻止游戏隐藏鼠标（Hook ShowCursor）"
+                                          Content="阻止鼠标隐藏"
                                           Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
                                           Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
                                 <CheckBox x:Name="BlockCursorLockCheck" Tag="BlockCursorLock"
-                                          Content="阻止游戏锁定鼠标（Hook ClipCursor/GetClipCursor）"
+                                          Content="阻止鼠标锁定"
                                           Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
                                           Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
 

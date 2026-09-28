@@ -20,6 +20,29 @@
  * each line "Name=Number". Missing keys fall back to the DLL defaults
  * listed here, so a bare injection follows the same behavior as the UI.
  *
+ * The option switches (mirroring the WPF controller's focus-spoof panel):
+ *   SuspendThreadsOnPatch (default 1) - stop the world while entry bytes
+ *                                     are patched.
+ *   EnableSubclass        (default 1) - subclass the target window; powers
+ *                                     both the activation spoofing and the
+ *                                     WM_INPUT drop.
+ *   BlockPollingApis      (default 0) - GetKeyState / GetAsyncKeyState /
+ *                                     GetKeyboardState report nothing
+ *                                     pressed.
+ *   BlockWmInput          (default 0) - real WM_INPUT is dropped in the
+ *                                     subclassed wndproc (needs
+ *                                     EnableSubclass).
+ *   BlockRawInputApis     (default 0) - GetRawInputData /
+ *                                     GetRawInputBuffer answer no data
+ *                                     (no subclass needed).
+ *   BlockCursorHide       (default 1) - arms the ShowCursor pass-through
+ *                                     control-point hook (blocking a hide
+ *                                     dead-loops the game).
+ *   BlockCursorLock       (default 1) - ClipCursor confinement is refused,
+ *                                     GetClipCursor reports the full
+ *                                     virtual screen.
+ *   DisableFocusSpoof     (default 0) - load the DLL but do nothing.
+ *
  * How it works, all in-process, on a delayed worker thread (loader-lock
  * safe):
  *   1. Finds the game's main window (largest visible top-level window of
@@ -36,38 +59,60 @@
  *      written while every other thread in the process is suspended (each
  *      thread id recorded and resumed exactly), which matches the
  *      stop-the-world guarantee Detours/EasyHook provide.
- *   3. Optionally blocks every keyboard/mouse input path so the game only
- *      renders and keeps accepting XInput gamepad input. Blocking is a
- *      single install, armed by a flag switch (g_block), never by
- *      re-patching. Three complementary cut points (ensure a working
- *      baseline; hook every path Raw Input games use):
+ *   3. Optionally blocks keyboard/mouse input for the game so it only
+ *      renders and keeps accepting XInput gamepad input. The gamepad
+ *      (XInput) polling is never touched. Blocking is a single install,
+ *      armed by per-layer flag switches, never by re-patching. It is
+ *      implemented ONLY at the API layer, exactly like the capture-hook
+ *      reference - the window procedure is never used to block input, so
+ *      the game window stays a completely normal, movable, resizable
+ *      host-desktop window:
  *        a. Window-procedure layer: SwallowProc (installed by the subclass
- *           when EnableSubclass=1, DEFAULT ON) swallows WM_INPUT and the
- *           legacy key/mouse messages right at the window procedure - per
- *           the Raw Input SDK contract (WM_INPUT arrives on the WindowProc,
- *           then GetRawInputData reads it out), this is the earliest cut.
- *           SwallowProc is written after the battle-tested capture-hook
- *           reference: every message is forwarded to the original wndproc
- *           via CallWindowProcW (activation messages are rewritten, e.g.
- *           WM_ACTIVATE forced to WA_ACTIVE) so the engine's activation
- *           state machine is never broken; no message is dropped mid-
- *           dispatch without a good reason. Never uses GetMessageW /
+ *           when EnableSubclass=1, DEFAULT ON) is a line-for-line mirror of
+ *           the battle-tested capture-hook reference
+ *           (Capture.Hook.WindowSubClass WindowSubClass.cs) with the SAME
+ *           message set and NOTHING else: WM_INPUT (real, wParam !=
+ *           SRI_WPARAM, dropped while blocking), WM_ACTIVATE /
+ *           WM_ACTIVATEAPP / WM_NCACTIVATE forced active, WM_MOUSEACTIVATE
+ *           forwarded with the target handle, WM_MOUSELEAVE / WM_KILLFOCUS
+ *           acknowledged, WM_SIZE / WM_MOUSEHOVER / WM_NCHITTEST pass
+ *           through. The reference handles NO legacy mouse/keyboard button
+ *           messages, no WM_SETCURSOR, no non-client button messages - and
+ *           neither do we; every other message (including ALL legacy
+ *           key/mouse messages) is forwarded untouched by the single
+ *           CallWindowProcW, so the OS keeps full window management
+ *           (dragging, resizing, closing). Only the SINGLE main window is
+ *           subclassed; nothing else - no child-window or
+ *           message-only-window subclassing, no periodic re-scan (both of
+ *           those wedged RE-engine titles). Never uses GetMessageW /
  *           PeekMessageW detours.
- *        b. Raw-API layer: GetRawInputData and GetRawInputBuffer return no
- *           data while blocking (size probes honored per the SDK, so no
- *           mis-sized heap allocations / "Heap allocation failed" dialog).
- *        c. Polled state APIs: GetAsyncKeyState / GetKeyState /
- *           GetKeyboardState return "nothing" for titles that poll.
- *      The hooks are only installed when "BlockKeyboardMouse"=1 (default 0
- *      so a fresh install stays on the previously-known-good baseline).
- *      XInput gamepad polling is never touched.
- *   4. Keeps the mouse cursor visible and free so the remote viewer can
- *      always see and move it, independent of what the game wants. Two
- *      individually controllable cut points ("BlockCursorHide", default 1,
- *      and "BlockCursorLock", default 1):
- *        a. ShowCursor: a game request to hide the cursor (ShowCursor(FALSE))
- *           is neutralized, so the display count never drops below zero.
- *        b. ClipCursor / GetClipCursor: a game request to confine the cursor
+ *        b. Real raw input is NEVER forwarded to the engine's raw path: field
+ *           evidence proved a WGC-captured RE-engine title wedges its UI
+ *           thread within ~1 second of receiving real raw input (its raw
+ *           handler + capture present path deadlock; the next physical
+ *           click then pops the Windows "not responding" force-close
+ *           dialog). So while blocking, MyGetRawInputData /
+ *           MyGetRawInputBuffer answer real handles with no data (size
+ *           probes honored per the SDK, so no mis-sized heap allocations /
+ *           "Heap allocation failed" dialog), exactly like the reference's
+ *           GetRawInputDataHook/GetRawInputBufferHook.
+ *        c. Polled state APIs: while blocking, GetAsyncKeyState /
+ *           GetKeyState / GetKeyboardState report nothing pressed - the
+ *           keyboard and mouse are simply disabled for the game. Not
+ *           blocking forwards the real state untouched.
+ *      The hooks are only installed when their explicit switch
+ *      ("BlockPollingApis" / "BlockWmInput" / "BlockRawInputApis", all
+ *      default 0) is set, so a fresh install stays on the
+ *      previously-known-good baseline.
+ *   4. Cursor hooks. The GAME owns cursor visibility: ShowCursor is hooked
+ *      as a strict pass-through (the reference's ShowCursorHook always
+ *      calls the original). Interfering with a hide - either rewriting
+ *      ShowCursor(FALSE) into TRUE or swallowing it - desyncs the game's
+ *      display-count belief from the real count and dead-loops games whose
+ *      show path is "while (ShowCursor(TRUE) != 0) {}", so "BlockCursorHide"
+ *      (default 1) only arms the pass-through hook as the config's control
+ *      point. Cursor CONFINEMENT is refused ("BlockCursorLock", default 1):
+ *        a. ClipCursor / GetClipCursor: a game request to confine the cursor
  *           to a region is refused, and any read-back reports the full
  *           virtual screen, so FPS-style center-locking never traps the
  *           remote cursor.
@@ -93,18 +138,55 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The tag the capture-hook reference uses as the wParam of its own
+   simulated raw input packets (its dev-input "simulated raw input"
+   protocol): WM_INPUT messages whose wParam != SRI_WPARAM are real input
+   and are swallowed while blocking. A direct-play client never posts
+   SRI_WPARAM-tagged packets, so every WM_INPUT this window sees while
+   blocking is real and is dropped; the forwarding branch is kept only to
+   mirror the reference's protocol exactly. */
+#define SRI_WPARAM 21760
+
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
 /* ------------------------------------------------------------------ */
 
 static HWND g_target;            ///< The window we keep looking "focused".
 static WNDPROC g_prev;           ///< Original wndproc of g_target.
+
 static volatile LONG g_state = 0;/* 0 = off, 1 = on */
 static volatile LONG g_stop = 0; /* 1 = worker must bail out */
+
+/* Diagnostic: number of WM_INPUT messages that reached THIS subclassed
+   window. If RE9 registers raw input on the main window, this counter grows
+   on every real input event even though the engine's GetRawInputData reads
+   are zeroed; a counter that stays 0 while the game still freezes means the
+   raw input is landing on ANOTHER window (child render surface or
+   RIDEV_INPUTSINK), which the reference's single-window subclass never saw
+   either. */
+static volatile LONG64 g_wmInputSeen = 0;
 static HANDLE g_worker = 0;      ///< The setup worker thread.
 static HMODULE g_host = 0;       ///< This DLL's module handle.
-static volatile LONG g_block = 0; ///< 1 while keyboard/mouse blocking is live.
-static volatile LONG g_disableRawInput = 0; ///< 1 if RawInput hook is disabled
+/* Keyboard/mouse input is disabled for the GAME at the API layer only -
+   exactly like the capture-hook reference - and the three layers are armed
+   INDEPENDENTLY by the controller's option list, so each features a single
+   self-explanatory toggle in the UI (no master/combination option):
+   - g_blockPolls:  GetAsyncKeyState / GetKeyState / GetKeyboardState report
+                    nothing pressed (the classic key/mouse polled-state cut).
+   - g_blockWmInput: real WM_INPUT (wParam != SRI_WPARAM) is dropped in the
+                    SwallowProc. Requires the window subclass (EnableSubclass)
+                    to be active, because the drop happens in the subclassed
+                    wndproc.
+   - g_blockRawApis: GetRawInputData / GetRawInputBuffer answer real handles
+                    with no data (size probes honored per the SDK). Works
+                    without a subclass, exactly like the reference's raw-API
+                    hooks.
+   The window procedure stays a plain reference mirror (it never eats legacy
+   messages), so the window remains a normal host-desktop window. The game
+   keeps rendering and XInput gamepad input is never touched. */
+static volatile LONG g_blockPolls = 0;    ///< 1 while polled key state is zeroed.
+static volatile LONG g_blockWmInput = 0;  ///< 1 while real WM_INPUT is dropped.
+static volatile LONG g_blockRawApis = 0;  ///< 1 while raw-API reads are zeroed.
 
 // ===== 前向声明（用于钩子安装等函数）=====
 typedef SHORT(WINAPI* FnKeyState)(int);
@@ -133,13 +215,14 @@ static bool SuspendThreadsOnPatchEnabled(void);
 static volatile LONG g_enableCursorHide; ///< 1 while blocking the game from hiding the cursor.
 static volatile LONG g_enableCursorLock; ///< 1 while blocking the game from locking the cursor.
 
-/* Keyboard/mouse blocking runs at the window-procedure layer, per the Raw
-   Input SDK contract: raw input arrives as WM_INPUT on the window's
-   WindowProc and is only then read out via GetRawInputData, so SwallowProc
-   swallows WM_INPUT and the legacy key/mouse messages right there - earlier
-   than any GetRawInputData hook, without touching user32 entry bytes
-   (GetMessageW/PeekMessageW detours crashed re9) and without touching the
-   message queue itself. */
+/* Keyboard/mouse blocking runs at two complementary layers. The raw-API
+   layer (GetRawInputData/GetRawInputBuffer) is a raw-input cut that needs no
+   subclass: WM_INPUT is always forwarded to the engine's registered window,
+   so the handle stays valid, but every read of the raw data returns zero
+   bytes. The window-procedure layer (only active when the subclass is
+   installed) drops the real WM_INPUT message itself. The whole design avoids
+   touching user32 entry bytes beyond the four thin detours above and avoids
+   touching the message queue itself. */
 // ===== 前向声明结束 =====
 
 /* ------------------------------------------------------------------ */
@@ -148,7 +231,6 @@ static volatile LONG g_enableCursorLock; ///< 1 while blocking the game from loc
 
 static volatile LONG g_workerLog = 0; ///< 1 after worker logging is open.
 static volatile LONG g_diagEvents = 0; ///< 1 when wndproc message tracing is on.
-static volatile LONG g_blockSetCursor = 0; ///< 1 to swallow WM_SETCURSOR while blocking.
 
 /**
  * @brief Emit a debug trace line via OutputDebugStringA.
@@ -242,25 +324,13 @@ static bool IsDiagEvent(UINT m) {
   switch (m) {
   case WM_MOUSEACTIVATE:
   case WM_MOUSELEAVE:
+  case WM_MOUSEHOVER:
   case WM_ACTIVATE:
   case WM_ACTIVATEAPP:
   case WM_NCACTIVATE:
   case WM_SETFOCUS:
   case WM_KILLFOCUS:
-  case WM_SETCURSOR:
-  case WM_CAPTURECHANGED:
-  case WM_LBUTTONDOWN:
-  case WM_LBUTTONUP:
-  case WM_MBUTTONDOWN:
-  case WM_MBUTTONUP:
-  case WM_RBUTTONDOWN:
-  case WM_RBUTTONUP:
-  case WM_NCLBUTTONDOWN:
-  case WM_NCLBUTTONUP:
-  case WM_NCRBUTTONDOWN:
-  case WM_NCRBUTTONUP:
-  case WM_NCMBUTTONDOWN:
-  case WM_NCMBUTTONUP:
+  case WM_NCHITTEST:
     return true;
   default:
     return false;
@@ -359,7 +429,6 @@ static HWND WINAPI MyGetFocus(void) {
   return g_realGetFocus();
 }
 
-/**
 /* ------------------------------------------------------------------ */
 /* Inline detour (trampoline) for the focus APIs                       */
 /* ------------------------------------------------------------------ */
@@ -1015,7 +1084,7 @@ static bool IsSafeProc(const void* p) {
  * (%APPDATA%\SunshineWindowController\focus_options.txt). The companion
  * WPF controller writes this file; the registry is deliberately never
  * touched so the feature needs no registry permissions anywhere.
- * @param name Switch name, e.g. "BlockKeyboardMouse".
+ * @param name Switch name, e.g. "BlockPollingApis".
  * @param def Value returned when the file or line is missing.
  * @return The stored value, or the default on any failure.
  */
@@ -1080,42 +1149,66 @@ static ULONG_PTR FileUintPtr(const char* name, ULONG_PTR def) {
 }
 
 /**
- * @brief Whether blocking keyboard/mouse input is enabled. Defaults to OFF
- * (a fresh install keeps the previously-known-good, non-blocking baseline;
- * the UI writes "BlockKeyboardMouse=1" into focus_options.txt to arm it).
- * XInput gamepad input is never affected.
- * @return True when the hooks should be installed.
+ * @brief Whether polled key/mouse state is zeroed (GetAsyncKeyState /
+ * GetKeyState / GetKeyboardState). Armed only by the explicit
+ * "BlockPollingApis" switch; defaults to OFF. XInput gamepad input is never
+ * affected.
+ * @return True when the poll hooks should be installed.
  */
-static bool InputBlockEnabled(void) {
-  return FileDword("BlockKeyboardMouse", 0) != 0;
+static bool PollBlockEnabled(void) {
+  return FileDword("BlockPollingApis", 0) != 0;
 }
 
 /**
- * @brief Hooked GetAsyncKeyState: reports nothing pressed while blocking.
+ * @brief Whether real WM_INPUT messages are dropped in the subclassed
+ * wndproc. Armed only by the explicit "BlockWmInput" switch; defaults to
+ * OFF. Only has an effect when the window subclass is installed
+ * (EnableSubclass=1), because the drop happens inside SwallowProc.
+ * @return True when real WM_INPUT should be swallowed.
+ */
+static bool WmInputBlockEnabled(void) {
+  return FileDword("BlockWmInput", 0) != 0;
+}
+
+/**
+ * @brief Whether the raw-API reads (GetRawInputData / GetRawInputBuffer) are
+ * zeroed. Armed only by the explicit "BlockRawInputApis" switch; defaults to
+ * OFF. Works with or without a window subclass.
+ * @return True when the raw-API hooks should be installed.
+ */
+static bool RawApisBlockEnabled(void) {
+  return FileDword("BlockRawInputApis", 0) != 0;
+}
+
+/**
+ * @brief Hooked GetAsyncKeyState: reports nothing pressed while key/mouse
+ * polling is blocked (BlockPollingApis).
  * @param vKey Virtual-key code.
- * @return 0 while active, otherwise the real state.
+ * @return 0 while blocking, otherwise the real state.
  */
 static SHORT WINAPI MyGetAsyncKeyState(int vKey) {
   if (g_realGetAsyncKeyState == 0) return 0;
-  if (g_block == 1)
+  if (g_blockPolls == 1)
     return 0;
   return g_realGetAsyncKeyState(vKey);
 }
 
 /**
- * @brief Hooked GetKeyState: reports nothing toggled/pressed while active.
+ * @brief Hooked GetKeyState: reports nothing toggled/pressed while key/mouse
+ * polling is blocked (BlockPollingApis).
  * @param nVirtKey Virtual-key code.
- * @return 0 while active, otherwise the real state.
+ * @return 0 while blocking, otherwise the real state.
  */
 static SHORT WINAPI MyGetKeyState(int nVirtKey) {
   if (g_realGetKeyState == 0) return 0;
-  if (g_block == 1)
+  if (g_blockPolls == 1)
     return 0;
   return g_realGetKeyState(nVirtKey);
 }
 
 /**
- * @brief Hooked GetKeyboardState: zeroes the whole state table while active.
+ * @brief Hooked GetKeyboardState: zeroes the whole state table while key/mouse
+ * polling is blocked (BlockPollingApis).
  * @param lpKeyState 256-byte output buffer.
  * @return TRUE.
  */
@@ -1124,7 +1217,7 @@ static BOOL WINAPI MyGetKeyboardState(PBYTE lpKeyState) {
     memset(lpKeyState, 0, 256);
     return TRUE;
   }
-  if (g_block == 1) {
+  if (g_blockPolls == 1) {
     memset(lpKeyState, 0, 256);
     return TRUE;
   }
@@ -1132,46 +1225,21 @@ static BOOL WINAPI MyGetKeyboardState(PBYTE lpKeyState) {
 }
 
 /**
- * @brief Whether a message carries direct keyboard/mouse input that
- * SwallowProc drops while blocking is active.
- * @param msg The message id.
- * @return True when the message carries direct user keyboard/mouse input.
- */
-static bool IsBlockedMessage(UINT msg) {
-  switch (msg) {
-  case WM_KEYDOWN:
-  case WM_KEYUP:
-  case WM_SYSKEYDOWN:
-  case WM_SYSKEYUP:
-  case WM_MOUSEMOVE:
-  case WM_LBUTTONDOWN:
-  case WM_LBUTTONUP:
-  case WM_MBUTTONDOWN:
-  case WM_MBUTTONUP:
-  case WM_RBUTTONDOWN:
-  case WM_RBUTTONUP:
-  case WM_XBUTTONDOWN:
-  case WM_XBUTTONUP:
-  case WM_MOUSEWHEEL:
-  case WM_MOUSEHWHEEL:
-    return true;
-  default:
-    return false;
-  }
-}
-
-/**
- * @brief Hooked GetRawInputData: while blocking is active the data query
- * returns 0 bytes so raw keyboard/mouse input is invisible to any code
- * path that reads it outside the message dispatch (the primary path is cut
- * earlier, at WM_INPUT in SwallowProc). The size probe (pData == NULL) is
+ * @brief Hooked GetRawInputData.
+ *
+ * While raw-API reads are blocked (BlockRawInputApis), raw input is
+ * invisible to every reader: the query returns 0 bytes so the engine's raw
+ * path never runs on real host input (measured: a WGC-captured RE-engine
+ * title wedges its UI thread within ~1 second of receiving real raw input,
+ * then the next click forces the "not responding" dialog). Unlike the
+ * WM_INPUT message drop this layer needs NO window subclass, exactly like
+ * the reference's GetRawInputDataHook. The size probe (pData == NULL) is
  * honored with the real required size so an engine that allocates its
- * RAWINPUT buffer from the probe never sees a bogus 0-length allocation
- * (the earlier "Heap allocation failed" dialog was the engine's heap
- * bookkeeping reacting to that inconsistency); the subsequent data query
- * is then satisfied with 0 bytes. Per the SDK, pData==NULL success returns
- * 0, pData!=NULL success returns bytes copied, error returns (UINT)-1.
- * @param hRawInput Raw input handle from WM_INPUT.
+ * RAWINPUT buffer from the probe never sees a bogus 0-length allocation; the
+ * subsequent data query is then satisfied with 0 bytes. Per the SDK,
+ * pData==NULL success returns 0, pData!=NULL success returns bytes copied,
+ * error returns (UINT)-1.
+ * @param hRawInput Raw input handle.
  * @param uiCommand RID_INPUT / RID_HEADER.
  * @param pData Destination buffer, NULL when querying the size.
  * @param pcbSize In/out buffer size.
@@ -1183,7 +1251,7 @@ static UINT WINAPI MyGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand,
                                      UINT cbSizeHeader) {
   if (g_realGetRawInputData == 0)
     return 0;
-  if (g_block == 1) {
+  if (g_blockRawApis == 1) {
     if (pData == NULL && pcbSize)
       return g_realGetRawInputData(hRawInput, uiCommand, NULL, pcbSize,
                                    cbSizeHeader);
@@ -1196,14 +1264,14 @@ static UINT WINAPI MyGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand,
 }
 
 /**
- * @brief Hooked GetRawInputBuffer: while blocking is active, no RAWINPUT
- * records are written so an engine that drains raw input in batches (the
- * pattern of GetRawInputBuffer-based loops) sees no keyboard/mouse events.
- * The buffer-size probe (pData == NULL) is honored with the real first-
- * record size so the engine's allocation never mis-sizes. Per the SDK,
- * pData==NULL success returns 0 (with the required size in *pcbSize),
- * pData!=NULL success returns the number of records written, error
- * returns (UINT)-1.
+ * @brief Hooked GetRawInputBuffer: while raw-API reads are blocked
+ * (BlockRawInputApis), no RAWINPUT records are written so an engine that
+ * drains raw input in batches (the pattern of GetRawInputBuffer-based loops)
+ * sees no keyboard/mouse events. The buffer-size probe (pData == NULL) is
+ * honored with the real first-record size so the engine's allocation never
+ * mis-sizes. Per the SDK, pData==NULL success returns 0 (with the required
+ * size in *pcbSize), pData!=NULL success returns the number of records
+ * written, error returns (UINT)-1.
  * @param pData RAWINPUT output buffer, NULL when probing the size.
  * @param pcbSize In/out buffer size in bytes.
  * @param cbSizeHeader Size of RAWINPUTHEADER.
@@ -1213,7 +1281,7 @@ static UINT WINAPI MyGetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize,
                                        UINT cbSizeHeader) {
   if (g_realGetRawInputBuffer == 0)
     return 0;
-  if (g_block == 1) {
+  if (g_blockRawApis == 1) {
     if (pData == NULL && pcbSize)
       return g_realGetRawInputBuffer(NULL, pcbSize, cbSizeHeader);
     if (pcbSize)
@@ -1224,53 +1292,57 @@ static UINT WINAPI MyGetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize,
 }
 
 /**
- * @brief Install the keyboard/mouse blocking hooks (inline detours) unless
- * disabled via the settings file. Failure of any single hook is non-fatal
+ * @brief Install the keyboard/mouse blocking hooks (inline detours) for
+ * each independently-armed layer. Failure of any single hook is non-fatal
  * and logged; the game keeps the remaining behavior.
  */
 static void InputBlockHookInstall(void) {
-  bool enabled = InputBlockEnabled();
-  Trace("InputBlockHookInstall: BlockKeyboardMouse=%d", enabled ? 1 : 0);
-  Dlog("InputBlockHookInstall: BlockKeyboardMouse=%d", enabled ? 1 : 0);
-  
-  if (!enabled) {
+  bool polls = PollBlockEnabled();
+  bool wmInput = WmInputBlockEnabled();
+  bool rawApis = RawApisBlockEnabled();
+  bool any = polls || wmInput || rawApis;
+  Trace("InputBlockHookInstall: BlockPollingApis=%d BlockWmInput=%d "
+        "BlockRawInputApis=%d",
+        polls ? 1 : 0, wmInput ? 1 : 0, rawApis ? 1 : 0);
+  Dlog("InputBlockHookInstall: BlockPollingApis=%d BlockWmInput=%d "
+       "BlockRawInputApis=%d",
+       polls ? 1 : 0, wmInput ? 1 : 0, rawApis ? 1 : 0);
+
+  if (!any) {
     Trace("keyboard/mouse blocking disabled by config");
     Dlog("keyboard/mouse blocking disabled by config");
     return;
   }
 
-  bool disableRawInput = FileDword("DisableRawInput", 0) != 0;
-  /* Window-procedure layer: SwallowProc also swallows WM_INPUT and legacy
-     key/mouse messages at the window procedure when a subclass is present.
-     The subclass is installed by the focus-spoof path (EnableSubclass,
-     default ON) and forwards every message via CallWindowProcW per the
-     battle-tested capture-hook reference pattern. The raw-API layer is a
-     secondary cut for code paths that read outside WM_INPUT dispatch. */
-
-  InterlockedExchange(&g_disableRawInput, disableRawInput ? 1 : 0);
+  InterlockedExchange(&g_blockWmInput, wmInput ? 1 : 0);
 
   {
     Trace("Installing detours for keyboard/mouse blocking");
     Dlog("Installing detours for keyboard/mouse blocking");
 
-    bool ok = DetourInstall((void*)g_exportGetAsyncKeyState,
-                       (void*)MyGetAsyncKeyState,
-                       (void**)&g_realGetAsyncKeyState, &g_detourAsk);
-    Dlog(ok ? "block: GetAsyncKeyState hooked"
-            : "block: GetAsyncKeyState skipped");
-    ok = DetourInstall((void*)g_exportGetKeyState, (void*)MyGetKeyState,
-                       (void**)&g_realGetKeyState, &g_detourKst);
-    Dlog(ok ? "block: GetKeyState hooked" : "block: GetKeyState skipped");
-    ok = DetourInstall((void*)g_exportGetKeyboardState,
-                       (void*)MyGetKeyboardState,
-                       (void**)&g_realGetKeyboardState, &g_detourKb);
-    Dlog(ok ? "block: GetKeyboardState hooked"
-            : "block: GetKeyboardState skipped");
+    if (polls) {
+      bool ok = DetourInstall((void*)g_exportGetAsyncKeyState,
+                         (void*)MyGetAsyncKeyState,
+                         (void**)&g_realGetAsyncKeyState, &g_detourAsk);
+      Dlog(ok ? "block: GetAsyncKeyState hooked"
+              : "block: GetAsyncKeyState skipped");
+      ok = DetourInstall((void*)g_exportGetKeyState, (void*)MyGetKeyState,
+                         (void**)&g_realGetKeyState, &g_detourKst);
+      Dlog(ok ? "block: GetKeyState hooked" : "block: GetKeyState skipped");
+      ok = DetourInstall((void*)g_exportGetKeyboardState,
+                         (void*)MyGetKeyboardState,
+                         (void**)&g_realGetKeyboardState, &g_detourKb);
+      Dlog(ok ? "block: GetKeyboardState hooked"
+              : "block: GetKeyboardState skipped");
+    } else {
+      Dlog("block: polled-state hooks skipped (BlockPollingApis=0)");
+    }
 
-    // RawInput 独立开关：默认开启两层 raw 钩子（GetRawInputData +
-    // GetRawInputBuffer），两者都按 SDK 语义实现（保留 size probe）。
-    if (!disableRawInput) {
-      ok = DetourInstall((void*)g_exportGetRawInputData,
+    /* Raw-API layer: independent of subclass and of the WM_INPUT drop. Both
+       GetRawInputData and GetRawInputBuffer are hooked and implement the SDK
+       semantics (size probe preserved). */
+    if (rawApis) {
+      bool ok = DetourInstall((void*)g_exportGetRawInputData,
                          (void*)MyGetRawInputData,
                          (void**)&g_realGetRawInputData, &g_detourRin);
       Dlog(ok ? "block: GetRawInputData hooked"
@@ -1281,18 +1353,20 @@ static void InputBlockHookInstall(void) {
       Dlog(ok ? "block: GetRawInputBuffer hooked"
               : "block: GetRawInputBuffer skipped");
     } else {
-      Dlog("block: raw input hooks disabled by config");
+      Dlog("block: raw-API hooks skipped (BlockRawInputApis=0)");
     }
   }
 
-  if (g_target && g_prev) {
-    Dlog("block: window-procedure subclass present");
-  } else {
-    Dlog("block: window-procedure subclass absent (raw-API layer only)");
+  if (wmInput && g_prev) {
+    Dlog("block: WM_INPUT drop armed on subclassed window");
+  } else if (wmInput) {
+    Dlog("block: WM_INPUT drop requested but no subclass present (blocked = "
+         "raw-API guard only)");
   }
 
-  InterlockedExchange(&g_block, 1);
-  Dlog("keyboard/mouse input blocked");
+  InterlockedExchange(&g_blockPolls, polls ? 1 : 0);
+  InterlockedExchange(&g_blockRawApis, rawApis ? 1 : 0);
+  Dlog("keyboard/mouse input blocked for the enabled layers");
 }
 
 /**
@@ -1300,7 +1374,9 @@ static void InputBlockHookInstall(void) {
  * pointers.
  */
 static void InputBlockHookRestore(void) {
-  InterlockedExchange(&g_block, 0);
+  InterlockedExchange(&g_blockPolls, 0);
+  InterlockedExchange(&g_blockWmInput, 0);
+  InterlockedExchange(&g_blockRawApis, 0);
   DetourRestore(&g_detourAsk, (void**)&g_realGetAsyncKeyState,
                 (void*)g_exportGetAsyncKeyState);
   DetourRestore(&g_detourKst, (void**)&g_realGetKeyState,
@@ -1326,11 +1402,13 @@ static Detour g_detourClipCursor;  ///< Detour record for ClipCursor.
 static Detour g_detourGetClipCursor; ///< Detour record for GetClipCursor.
 
 /**
- * @brief Whether the game is prevented from hiding the cursor via
- * "BlockCursorHide" (default ON). With this set, ShowCursor(FALSE) is
- * neutralized so the cursor never disappears (RE-engine games hide the
- * cursor during menus / cutscenes, which breaks the remote cursor).
- * @return True when the cursor should stay visible.
+ * @brief Whether the ShowCursor control-point hook is armed via
+ * "BlockCursorHide" (default ON). The hook itself is a STRICT pass-through:
+ * blocking a hide desyncs the game's display-count belief from the real one
+ * and dead-loops games whose show path is
+ * "while (ShowCursor(TRUE) != 0) {}", so the hook only stays installed as
+ * the config's control point (see MyShowCursor).
+ * @return True when the ShowCursor hook should be installed.
  */
 static bool CursorHideEnabled(void) {
   return FileDword("BlockCursorHide", 1) != 0;
@@ -1349,19 +1427,28 @@ static bool CursorLockEnabled(void) {
 }
 
 /**
- * @brief Hooked ShowCursor: while blocking is active, a FALSE request
- * (hide) is turned into a no-op so the display count never drops below
- * zero and the cursor stays visible; TRUE is passed through.
+ * @brief Hooked ShowCursor: STRICT pass-through - the game owns cursor
+ * visibility.
+ *
+ * The reference's ShowCursorHook always calls the original, and this must
+ * stay that way: the ShowCursor display count is part of the game's own
+ * state machine. Interfering with a hide desyncs the game's belief about
+ * the count from the real one. Field-tested failure modes:
+ *   - Rewriting the request (ShowCursor(FALSE) -> ShowCursor(TRUE)) wedged
+ *     an RE-engine title's cursor/input logic the moment it was enabled
+ *     (reproduced every run).
+ *   - Swallowing the hide (returning a mirrored count without calling the
+ *     original) leaves the real count at 0 while the game believes it is
+ *     -1; a game whose show path is "while (ShowCursor(TRUE) != 0) {}"
+ *     then spins forever (dead-loop).
+ * The hook stays installed purely as the config's control point, which
+ * keeps the WPF controller toggle wired and safe.
  * @param bShow TRUE to show, FALSE to hide.
- * @return The new display count.
+ * @return The new display count, from the original function.
  */
 static int WINAPI MyShowCursor(BOOL bShow) {
   if (g_realShowCursor == 0)
     return 0;
-  if (g_enableCursorHide == 1 && bShow == FALSE) {
-    /* Stay visible: keep the reference count pinned at >= 1. */
-    return g_realShowCursor(TRUE);
-  }
   return g_realShowCursor(bShow);
 }
 
@@ -1455,10 +1542,21 @@ static void CursorBlockHookRestore(void) {
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief Replacement wndproc for the target window. Spoofs activation
- * messages while spoofing is active; otherwise it is a pure pass-through
- * (so a stale or late install/restore can never hurt the game). No file
- * I/O here by design.
+ * @brief Replacement wndproc for the target window. A line-for-line mirror
+ * of the battle-tested capture-hook reference (Capture.Hook.WindowSubClass
+ * WindowSubClass.cs), using the SAME message set and NOTHING else: WM_INPUT
+ * (real, wParam != SRI_WPARAM, is dropped while blocking), WM_ACTIVATE /
+ * WM_ACTIVATEAPP / WM_NCACTIVATE forced active, WM_MOUSEACTIVATE forwarded
+ * with the target handle, WM_MOUSELEAVE / WM_KILLFOCUS acknowledged,
+ * WM_SIZE / WM_MOUSEHOVER / WM_NCHITTEST pass through. The reference
+ * handles NO legacy mouse/keyboard button messages, no WM_SETCURSOR, no
+ * non-client button messages - and neither do we; they are all forwarded
+ * untouched by the single CallWindowProcW at the end, exactly like the
+ * reference. The window therefore stays a completely normal host-desktop
+ * window: it can be dragged, resized and closed. The "disable keyboard and
+ * mouse" guarantee for the game comes entirely from the API layer (raw and
+ * polled reads return nothing while blocking, and real WM_INPUT is dropped)
+ * - never from the window procedure, mirroring the reference.
  *
  * @param h The target window.
  * @param m Message id.
@@ -1467,35 +1565,42 @@ static void CursorBlockHookRestore(void) {
  * @return Result of the original wndproc (or 0 for swallowed messages).
  */
 static LRESULT CALLBACK SwallowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-  WNDPROC prev = g_prev;
   /* Always forward to the original wndproc via CallWindowProcW, matching
      the battle-tested subclass pattern (see Capture.Hook WindowSubClass).
-     Only the messages below are rewritten/swallowed before forwarding; a
-     bare return would break the engine's activation state machine (the
-     crashes seen when WM_ACTIVATE/mouse-activation messages were dropped
-     mid-dispatch). If the window is gone/no longer subclassed we fall back
-     to DefWindowProcW, which is always safe. */
+     Only the messages below are rewritten/swallowed before forwarding. If
+     the window is gone/no longer subclassed we fall back to DefWindowProcW
+     (a pass-through), which is always safe. */
+  WNDPROC prev = g_prev;
   if (!prev || !IsWindow(h))
     return DefWindowProcW(h, m, w, l);
 
-  bool block = g_block == 1;
+  bool block = g_blockWmInput == 1;
 
   if (IsDiagEvent(m))
     DiagEvent(h, m, w, l, block);
 
   switch (m) {
+  case WM_SIZE:
+    /* Forward: the engine owns its resize/backbuffer handling. */
+    break;
   case WM_INPUT:
-    /* Raw keyboard/mouse input: when blocking, drop the message so the
-       game's own wndproc never sees a key/mouse event. DefWindowProcW
-       performs the system's raw-input handle cleanup; the Raw Input SDK
-       contract is exactly "WM_INPUT arrives, then GetRawInputData reads
-       it out", so cutting it here stops every read path at once. */
-    if (block)
-      return DefWindowProcW(h, m, w, l);
+    /* Drop REAL raw input (wParam != SRI_WPARAM, the tag the capture-hook
+       reference gives its own simulated packets) while blocking, mirroring
+       the reference exactly: the engine's raw path must never run on real
+       host events (measured: it wedges the UI thread and hard-freezes the
+       input - ghost window + force-close dialog). The reference forwards
+       simulated packets carrying wParam == SRI_WPARAM from its capture-hook
+       client; a direct-play client never posts those, so every WM_INPUT
+       this window sees is real and is swallowed. Acknowledging the real
+       packet here also keeps the engine from entering a handler that waits
+       for data that will never arrive. */
+    InterlockedIncrement64(&g_wmInputSeen);
+    if (block && w != (WPARAM)SRI_WPARAM)
+      return 0;
     break;
   case WM_ACTIVATE:
     /* Keep the window looking active: force WA_ACTIVE and clear the
-       lParam (the window being deactivated), then forward. */
+       window being deactivated, exactly like the reference. */
     if (g_state == 1) {
       w = WA_ACTIVE;
       l = 0;
@@ -1507,83 +1612,61 @@ static LRESULT CALLBACK SwallowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       l = 0;
     }
     break;
-  case WM_NCACTIVATE:
+  case WM_MOUSELEAVE:
+    /* Never report the mouse as having left the client area (matches the
+       reference exactly: return 0, nothing else). */
+    return 0;
+  case WM_KILLFOCUS:
+    /* Swallow: the window never "loses" focus (matches the reference
+       exactly: return 0, nothing else). */
     if (g_state == 1)
+      return 0;
+    break;
+  case WM_NCHITTEST:
+    /* Pass through untouched - the reference explicitly notes that an
+       RE-engine title ("鬼泣5/DMC5") must NOT have this message
+       intercepted. */
+    break;
+  case WM_NCACTIVATE:
+    if (g_state == 1) {
       w = 1; /* non-client looks active */
+      l = 0;
+    }
     break;
   case WM_MOUSEACTIVATE:
-    /* Forward with the target window handle so the game never decides
-       "don't activate, eat the mouse click" (MA_NOACTIVATE). */
+    /* Forward with the target window handle, exactly like the reference:
+       the engine never decides "don't activate, eat the mouse click". */
     if (g_state == 1)
       w = (WPARAM)g_target;
     break;
-  case WM_KILLFOCUS:
-    /* Swallow: the window never "loses" focus. Engines that track focus via
-       the WM_SETFOCUS/WM_KILLFOCUS pair (UE5/EA titles, e.g. Split Fiction)
-       drop gamepad and keyboard input when their pair went to "unfocused";
-       a swallowed KILLFOCUS therefore re-issues a synthetic WM_SETFOCUS for
-       the target so the pair stays balanced and the input layer keeps
-       accepting gamepad. */
-    if (g_state == 1) {
-      PostMessageW(h, WM_SETFOCUS, (WPARAM)g_target, 0);
-      return 0;
-    }
-    break;
-  case WM_MOUSELEAVE:
-    /* Never report the mouse as having left the client area. */
-    return 0;
-  case WM_NCHITTEST:
-    /* Must not be intercepted: some RE-engine titles break if we answer
-       HTCLIENT here (reference code note). */
-    break;
-  case WM_SIZE:
-    break;
-  case WM_SETCURSOR:
-    /* Optional extra hardening for WGC-captured RE-engine titles: the
-       engine performs synchronous D3D12 GPU work inside its WM_SETCURSOR
-       handling, and under window capture that render path never completes -
-       field evidence showed the wndproc hung inside WM_SETCURSOR right
-       after the first client-area click (no further message ever
-       dispatched), with the stack deep in D3D12Core/d3d12 fence waits.
-       The classic mouse-button messages are already swallowed by the
-       default branch, so WM_SETCURSOR is the only pointer message that
-       still reaches the engine while blocking. When BlockSetCursor=1 we
-       swallow it too, keeping the engine completely out of the pointer-
-       driven GPU path; the cursor is irrelevant on the remote client
-       (always hidden by the cursor-block hooks, pointer drawn client-side
-       by the streaming client). */
-    if (block && g_blockSetCursor == 1)
-      return 0;
-    break;
   default:
-    /* Legacy key/mouse messages: swallow while blocking. Everything else
-       (WM_PAINT, WM_TIMER, engine-private messages, ...) is forwarded
-       untouched. */
-    if (block && IsBlockedMessage(m))
-      return 0;
+    /* Everything else - including every legacy key/mouse message - is
+       forwarded untouched, exactly like the reference's single
+       CallWindowProcW at the end. */
     break;
   }
   return CallWindowProcW(prev, h, m, w, l);
 }
 
 /* ------------------------------------------------------------------ */
-/* Owning-thread install/restore via a WH_GETMESSAGE hook              */
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
-/* Window subclass install/restore (direct, race-free)                 */
+/* Window subclass install/restore (single window, mirror of the        */
+/* battle-tested Capture.Hook.WindowSubClass reference)                 */
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief Replace the target window's wndproc with SwallowProc.
+ * @brief Replace the target window's wndproc with SwallowProc, exactly
+ * like the capture-hook reference (SetWindowLongPtrW + forward everything
+ * via CallWindowProcW). Only the SINGLE main window is subclassed - the
+ * reference never touches child or message-only windows, and neither do we
+ * (subclassing the render window or a per-thread input window introduced
+ * an immediate "window not responding" on RE-engine titles, because the
+ * engine's own wndproc was bypassed mid-render).
  *
- * This is the battle-tested pattern from the capture-hook reference
- * (SetWindowLongPtrW + forward everything via CallWindowProcW). It runs
- * on the injected DLL's worker thread - SetWindowLongPtrW is legal from
- * any thread, and because SwallowProc is a pass-through while g_state is
- * off and always forwards to the original proc, a late or stale class can
- * never wedge the engine. The stored original proc is verified after the
- * write and dropped if the engine replaced the proc behind our back.
+ * Runs on the injected DLL's worker thread - SetWindowLongPtrW is legal
+ * from any thread, and because SwallowProc always forwards to the original
+ * proc, a late or stale install can never wedge the engine. The stored
+ * original proc is verified after the write and dropped if the engine
+ * replaced the proc behind our back.
  *
  * @return True when SwallowProc is now the active wndproc.
  */
@@ -1598,14 +1681,19 @@ static bool SubClassInstall(void) {
     g_prev = 0; /* engine replaced the proc again behind our back */
     return false;
   }
-  /* Per the reference: after subclassing, send the window a burst of
-     activation messages so the engine flushes its "inactive" state. The
-     WM_SETFOCUS wParam is the window that gained the keyboard focus -
-     engines that read it (UE5/EA titles) see the target itself, matching
-     the GetFocus detour so all focus signals agree on the same HWND. */
+  /* Post the activation burst ASYNCHRONOUSLY (PostMessageW, not
+     SendMessageW). This is the original focusspoof timing that never made
+     an injecting game window busy: the messages queue to the engine's own
+     thread and are processed at its pace, so no foreign thread force-drops
+     WM_ACTIVATE/WM_SETFOCUS into a window that is mid-boot (mid-boot
+     synchronous SendMessage into a WGC-captured D3D12 title is exactly
+     what produced the immediate "not responding"). The reference's
+     SendMessage variant is safe there only because that library is loaded
+     at process start, a hundred-plus milliseconds before the window even
+     exists. */
   PostMessageW(g_target, WM_ACTIVATE, WA_ACTIVE, 0);
-  PostMessageW(g_target, WM_ACTIVATEAPP, 1, 0);
-  PostMessageW(g_target, WM_SETFOCUS, (WPARAM)g_target, 0);
+  PostMessageW(g_target, WM_ACTIVATEAPP, WA_ACTIVE, 0);
+  PostMessageW(g_target, WM_SETFOCUS, 0, 0);
   return true;
 }
 
@@ -1616,11 +1704,8 @@ static bool SubClassInstall(void) {
  * engines (RE-engine, UE5/EA titles) legitimately re-install their own
  * wndproc during the session (fullscreen switches, swapchain rebuilds,
  * message-loop re-arounds). Writing our stored g_prev over such a current
- * proc would clobber the engine's live proc with a stale one, permanently
- * breaking the window's message processing - exactly the "SpoofStop does
- * not recover" symptom. If the engine already replaced the proc, we clear
- * g_prev (SwallowProc then falls back to DefWindowProcW defensively) and
- * leave the window entirely untouched.
+ * proc would clobber the engine's live proc with a stale one. If the
+ * engine already replaced the proc, leave the window entirely untouched.
  */
 static void SubClassRestore(void) {
   if (g_prev && IsWindow(g_target)) {
@@ -1707,6 +1792,123 @@ static bool FocusSpoofDisabled(void) {
 }
 
 /**
+ * @brief Log one window's identity to the worker log.
+ *
+ * Used by the input-routing diagnosis so the window layout of the target
+ * process is visible: a click that never reaches the subclassed main window
+ * lands on one of these (a child render surface, a caption button, or a
+ * second top-level window). The class name alone usually reveals which one
+ * the engine routes input through.
+ *
+ * @param h The window handle.
+ * @param kind Label shown before the handle ("top" or "child").
+ */
+static void LogWindowInfo(HWND h, const char* kind) {
+  char cls[128] = "?";
+  WCHAR title[256] = L"?";
+  GetClassNameA(h, cls, sizeof(cls));
+  GetWindowTextW(h, title, 256);
+  DWORD pid = 0;
+  DWORD tid = GetWindowThreadProcessId(h, &pid);
+  RECT r;
+  GetWindowRect(h, &r);
+  Dlog("  %s h=%p class=%s title=%ls vis=%d tid=%lu rect=%ld,%ld %ldx%ld",
+       kind, (void*)h, cls, title, IsWindowVisible(h) ? 1 : 0, tid, r.left,
+       r.top, r.right - r.left, r.bottom - r.top);
+}
+
+/**
+ * @brief Callback: log one child window (WNDENUMPROC-compatible; a plain
+ * lambda does not convert to the 32-bit stdcall WNDENUMPROC type).
+ * @param c Child window handle.
+ * @param lp Unused.
+ * @return Always TRUE to keep enumerating.
+ */
+static BOOL CALLBACK EnumChildForDiag(HWND c, LPARAM lp) {
+  (void)lp;
+  LogWindowInfo(c, "child");
+  return TRUE;
+}
+
+/**
+ * @brief Callback: log one top-level window of the process and its children.
+ * @param h Window handle.
+ * @param lp Expected to point at the target process id.
+ * @return Always True to keep enumerating.
+ */
+static BOOL CALLBACK EnumTopForDiag(HWND h, LPARAM lp) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(h, &pid);
+  if (pid == (DWORD)lp) {
+    LogWindowInfo(h, "top");
+    EnumChildWindows(h, EnumChildForDiag, 0);
+  }
+  return TRUE;
+}
+
+/**
+ * @brief Dump the target process's window tree and raw-input registration.
+ *
+ * This is the decisive diagnostic for the "click dies but the subclassed
+ * window sees nothing" symptom: it shows (a) whether the render surface is
+ * a child or a separate top-level window, and (b) whether raw input is
+ * registered anywhere in the process (and in that case on which window it
+ * sinks). Called once from the worker right before spoofing goes live, so
+ * the report is in the same log as the subsequent click trace.
+ */
+static void DumpInputRouting(void) {
+  DWORD selfPid = GetCurrentProcessId();
+  Dlog("== input routing (pid=%lu) ==", selfPid);
+  EnumWindows(EnumTopForDiag, (LPARAM)selfPid);
+
+  UINT devCount = 0;
+  UINT cbItem = sizeof(RAWINPUTDEVICELIST);
+  GetRegisteredRawInputDevices(NULL, &devCount, cbItem);
+  Dlog("raw-input: %u device(s) registered by this process", devCount);
+  if (devCount > 0 && devCount < 64) {
+    RAWINPUTDEVICELIST list[64];
+    /* The API fills RAWINPUTDEVICELIST entries despite the parameter being
+       typed PRAWINPUTDEVICE (a long-standing SDK quirk). */
+    if (GetRegisteredRawInputDevices((PRAWINPUTDEVICE)list, &devCount,
+                                     cbItem)) {
+      for (UINT i = 0; i < devCount; i++)
+        Dlog("  rawdevice h=%p type=%u", list[i].hDevice, list[i].dwType);
+    }
+  }
+  Dlog("== input routing end ==");
+}
+
+/**
+ * @brief Heartbeat thread: proves the worker lives independently of the
+ * game's UI thread.
+ *
+ * When the game wedges, its message pump stops but THIS thread keeps
+ * logging; the last wndproc line before the gap names the exact message
+ * whose handler froze it. Also reports the live WM_INPUT counter so we can
+ * see whether real raw input is flowing to the subclassed main window at
+ * all (0 while freezing = input is routed elsewhere).
+ * @param param Unused.
+ * @return 0.
+ */
+static DWORD WINAPI HeartbeatThread(LPVOID param) {
+  (void)param;
+  long n = 0;
+  while (InterlockedExchangeAdd(&g_stop, 0) == 0) {
+    Sleep(5000);
+    if (InterlockedExchangeAdd(&g_stop, 0) != 0)
+      break;
+    n++;
+    Dlog("heartbeat %ld wmInputSeen=%lld", n,
+         (long long)InterlockedExchangeAdd64(&g_wmInputSeen, 0));
+  }
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Setup worker                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
  * @brief Setup worker: wait for the loader lock to be released, then
  * find the window, install detours and subclass it.
  * @param param Unused.
@@ -1733,19 +1935,31 @@ char path[MAX_PATH];
   g_diagEvents = FileDword("DiagFocusEvents", 0);
   if (g_diagEvents == 1)
     Dlog("wndproc message tracing enabled (DiagFocusEvents=1)");
-  g_blockSetCursor = FileDword("BlockSetCursor", 0);
-  if (g_blockSetCursor == 1)
-    Dlog("WM_SETCURSOR swallowed while blocking (BlockSetCursor=1)");
   Dlog("worker started, pid=%lu", GetCurrentProcessId());
 
   /* Prefer the window handle passed by the controller ("TargetWindow" in
      the settings file). Only fall back to self-discovery when the controller
-     did not provide one - the handle is authoritative and locked. */
+     did not provide one - the handle is authoritative and locked. A stale
+     handle from a previous session (window destroyed, or the controller
+     enumerated a window of another process) must be dropped and replaced by
+     self-discovery, otherwise the subclass and detours would target a dead
+     or foreign window and spoofing would silently do nothing. */
   ULONG_PTR ctlTarget = FileUintPtr("TargetWindow", 0);
-  if (ctlTarget && IsWindow((HWND)ctlTarget)) {
+  bool ctlValid = ctlTarget != 0 && IsWindow((HWND)ctlTarget);
+  if (ctlValid) {
+    DWORD owner = 0;
+    GetWindowThreadProcessId((HWND)ctlTarget, &owner);
+    ctlValid = owner == GetCurrentProcessId();
+  }
+  if (ctlValid) {
     g_target = (HWND)ctlTarget;
     Dlog("target window=%p (from controller)", (void*)g_target);
   } else {
+    if (ctlTarget) {
+      Dlog("controller target %p stale or foreign; self-discovering",
+           (void*)ctlTarget);
+      Trace("controller target invalid; falling back to self-discovery");
+    }
     g_target = FindTargetWindow();
     if (!g_target) {
       Trace("no target window found");
@@ -1790,6 +2004,8 @@ char path[MAX_PATH];
 
   Trace("focus spoof active");
   Dlog("focus spoof active");
+  DumpInputRouting();
+  CreateThread(NULL, 0, HeartbeatThread, 0, 0, NULL);
   return 0;
 }
 
@@ -1803,6 +2019,7 @@ char path[MAX_PATH];
  * @return True when accepted (not necessarily completed yet).
  */
 static BOOL SpoofStartImpl(void) {
+  InterlockedExchange(&g_stop, 0);
   if (InterlockedCompareExchange(&g_state, 1, 0) == 1)
     return TRUE; /* already on */
 
@@ -1826,6 +2043,7 @@ static BOOL SpoofStartImpl(void) {
  * @return True.
  */
 static BOOL SpoofStopImpl(void) {
+  InterlockedExchange(&g_stop, 1);
   InterlockedExchange(&g_state, 0);
   Dlog("stop: g_state=0");
   /* Restore the detoured entry bytes first so g_real* can safely go back

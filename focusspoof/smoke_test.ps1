@@ -13,12 +13,12 @@ $env:APPDATA = Join-Path $env:TEMP "focusspoof_smoke"
 $smokeConfigDir = Join-Path $env:APPDATA "SunshineWindowController"
 New-Item -ItemType Directory -Force -Path $smokeConfigDir | Out-Null
 @"
-BlockKeyboardMouse=1
 SuspendThreadsOnPatch=1
 DisableFocusSpoof=0
 EnableSubclass=1
-DisableRawInput=0
-BlockLegacyMessages=1
+BlockPollingApis=1
+BlockWmInput=1
+BlockRawInputApis=1
 BlockCursorHide=1
 BlockCursorLock=1
 "@ | Set-Content -Path (Join-Path $smokeConfigDir "focus_options.txt") -Encoding ASCII
@@ -117,8 +117,8 @@ else { Write-Host "FOCUS SPOOF FAILED (no me:1 after injection)" }
 
 # Input blocking asserts two layers now:
 #   1. The window-procedure layer is live: the subclassed SwallowProc eats a
-#      posted WM_KEYDOWN before it reaches testtarget's own WndProc, so a
-#      key_blocked=1 line must appear in A's log.
+#      posted WM_KEYDOWN (a legacy key message) before it reaches testtarget's
+#      own WndProc, so a key_blocked=1 line must appear in A's log.
 #   2. The worker reached "focus spoof active" and installed the blocking
 #      detours without crashing the process.
 $workerLog = Join-Path $env:TEMP "focusspoof_worker.log"

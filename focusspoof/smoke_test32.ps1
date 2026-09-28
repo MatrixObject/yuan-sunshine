@@ -13,12 +13,12 @@ $env:APPDATA = Join-Path $env:TEMP "focusspoof_smoke"
 $smokeConfigDir = Join-Path $env:APPDATA "SunshineWindowController"
 New-Item -ItemType Directory -Force -Path $smokeConfigDir | Out-Null
 @"
-BlockKeyboardMouse=1
 SuspendThreadsOnPatch=1
 DisableFocusSpoof=0
 EnableSubclass=1
-DisableRawInput=0
-BlockLegacyMessages=1
+BlockPollingApis=1
+BlockWmInput=1
+BlockRawInputApis=1
 BlockCursorHide=1
 BlockCursorLock=1
 "@ | Set-Content -Path (Join-Path $smokeConfigDir "focus_options.txt") -Encoding ASCII

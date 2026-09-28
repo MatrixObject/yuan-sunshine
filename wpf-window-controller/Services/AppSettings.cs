@@ -24,28 +24,28 @@ namespace SunshineWindowController.Services
         /// <summary>录制时保持游戏窗口激活（伪聚焦），默认开启</summary>
         public bool KeepFocused { get; set; } = true;
 
-        /// <summary>屏蔽键鼠输入（XInput 手柄始终有效），默认关闭</summary>
-        public bool BlockKeyboardMouse { get; set; } = false;
-
         // ===== 焦点伪造选项 =====
 
         /// <summary>打补丁时冻结线程，默认开启</summary>
         public bool SuspendThreadsOnPatch { get; set; } = true;
 
-        /// <summary>启用窗口子类化（旧方式，大多数游戏建议关闭）</summary>
+        /// <summary>开启窗口子类化（用于伪聚焦和 WM_INPUT 屏蔽），默认开启</summary>
         public bool EnableSubclass { get; set; } = true;
 
-        /// <summary>阻止游戏隐藏鼠标光标（Hook ShowCursor），默认开启</summary>
+        /// <summary>屏蔽键鼠状态 API（GetKeyState / GetAsyncKeyState / GetKeyboardState），默认关闭</summary>
+        public bool BlockPollingApis { get; set; } = false;
+
+        /// <summary>屏蔽 WM_INPUT（需要开启窗口子类化），默认关闭</summary>
+        public bool BlockWmInput { get; set; } = false;
+
+        /// <summary>屏蔽 RawInput 相关 API（GetRawInputData/GetRawInputBuffer，与 WM_INPUT 功能相同但不需要子类化），默认关闭</summary>
+        public bool BlockRawInputApis { get; set; } = false;
+
+        /// <summary>ShowCursor 直通控制点（拦截隐藏会使游戏显示计数失同步而死循环），默认开启</summary>
         public bool BlockCursorHide { get; set; } = true;
 
-        /// <summary>阻止游戏锁定鼠标光标（Hook ClipCursor/GetClipCursor），默认开启</summary>
+        /// <summary>阻止游戏锁定鼠标光标（拒绝 ClipCursor / GetClipCursor 报告全屏），默认开启</summary>
         public bool BlockCursorLock { get; set; } = true;
-
-        /// <summary>GetRawInputData/GetRawInputBuffer 钩子是键鼠屏蔽的主通道（按 SDK 语义返回 0），默认开启</summary>
-        public bool DisableRawInput { get; set; } = false;
-
-        /// <summary>窗口过程层（子类化吞 WM_INPUT），re9 上会闪退，默认关闭</summary>
-        public bool BlockLegacyMessages { get; set; } = false;
 
         /// <summary>禁用所有焦点伪造（仅加载 DLL）</summary>
         public bool DisableAll { get; set; } = false;
