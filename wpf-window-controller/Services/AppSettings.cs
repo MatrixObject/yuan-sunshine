@@ -50,11 +50,13 @@ namespace SunshineWindowController.Services
         /// <summary>禁用所有焦点伪造（仅加载 DLL）</summary>
         public bool DisableAll { get; set; } = false;
 
+        /// <summary>
+        /// 设置文件路径：本程序所在目录下的 SunshineWindowController.json（便携式，
+        /// 不写 %APPDATA%，随包目录整体挪动/复制时配置不丢失、不串机器）。
+        /// 与包内 sunshine.exe 同目录，文件名带控制器全名以区分归属。
+        /// </summary>
         private static string SettingsPath =>
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "SunshineWindowController",
-                "settings.json");
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SunshineWindowController.json");
 
         /// <summary>
         /// 从磁盘加载设置，文件不存在时返回默认值。
@@ -68,11 +70,32 @@ namespace SunshineWindowController.Services
                     return new AppSettings();
 
                 var json = File.ReadAllText(path);
-                return JsonConvert.DeserializeObject<AppSettings>(json) ?? new AppSettings();
+                var settings = JsonConvert.DeserializeObject<AppSettings>(json) ?? new AppSettings();
+                NormalizeSunshineExePath(settings);
+                return settings;
             }
             catch (Exception)
             {
                 return new AppSettings();
+            }
+        }
+
+        /// <summary>
+        /// 归一化 sunshine.exe 路径：当本程序所在目录存在 sunshine.exe（便携包场景）时，
+        /// 强制使用相对路径 ./sunshine.exe，覆盖历史遗留的绝对路径，保证包随目录挪动仍有效。
+        /// </summary>
+        /// <param name="settings">加载后的设置。</param>
+        private static void NormalizeSunshineExePath(AppSettings settings)
+        {
+            try
+            {
+                var local = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sunshine.exe");
+                if (File.Exists(local))
+                    settings.SunshineExePath = "./sunshine.exe";
+            }
+            catch (Exception)
+            {
+                // 静默失败，保留原设置
             }
         }
 

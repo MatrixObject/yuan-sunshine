@@ -11,17 +11,17 @@ namespace SunshineWindowController.Services
     /// 从而在失焦时仍能保持完整渲染帧率和 XInput 手柄输入响应。
     ///
     /// 注入器（injectedll.exe）由本类启动，DLL 行为受配置文件控制。
-    /// 配置文件路径：%APPDATA%\SunshineWindowController\focus_options.txt
+    /// 配置文件路径：本程序所在目录下的 focus_options.txt（DLL 读取其自身旁的同名文件）
     /// 格式：每行一个键值对，如 "BlockPollingApis=1"
     /// </summary>
     internal static class FocusSpoof
     {
-        /// <summary>配置文件路径</summary>
+        /// <summary>
+        /// 配置文件路径：本程序所在目录下的 focus_options.txt（便携式，
+        /// 不写 %APPDATA%；DLL 与本程序同目录，按自身位置读取同一文件）。
+        /// </summary>
         public static string ConfigPath =>
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "SunshineWindowController",
-                "focus_options.txt");
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "focus_options.txt");
 
         /// <summary>
         /// 清理过期的 focusspoof 目标日志。

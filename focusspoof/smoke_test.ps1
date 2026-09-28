@@ -6,12 +6,10 @@ $injectedll = Join-Path $dir "injectedll.exe"
 $dllPath    = Join-Path $dir "focusspoof.dll"
 $targetExe  = Join-Path $dir "testtarget.exe"
 
-# Isolate the DLL's settings file: point an isolated APPDATA at a temp dir
-# with a known-good config (block ON so the smoke test can observe
-# key_blocked:1). This never touches the real %APPDATA%.
-$env:APPDATA = Join-Path $env:TEMP "focusspoof_smoke"
-$smokeConfigDir = Join-Path $env:APPDATA "SunshineWindowController"
-New-Item -ItemType Directory -Force -Path $smokeConfigDir | Out-Null
+# The DLL reads focus_options.txt next to itself, so write the known-good
+# config (block ON so the smoke test can observe key_blocked:1) right beside
+# focusspoof.dll in this script's directory. The real %APPDATA% is untouched.
+$configPath = Join-Path $dir "focus_options.txt"
 @"
 SuspendThreadsOnPatch=1
 DisableFocusSpoof=0
@@ -21,7 +19,7 @@ BlockWmInput=1
 BlockRawInputApis=1
 BlockCursorHide=1
 BlockCursorLock=1
-"@ | Set-Content -Path (Join-Path $smokeConfigDir "focus_options.txt") -Encoding ASCII
+"@ | Set-Content -Path $configPath -Encoding ASCII
 
 Add-Type @'
 using System;
@@ -64,7 +62,7 @@ $hB = Get-ProcMainWindow $pb
 Write-Host "A pid=$($pa.Id) hwnd=$hA ; B pid=$($pb.Id) hwnd=$hB"
 
 # Mirror the controller: hand the DLL A's window handle before injecting.
-Add-Content -Path (Join-Path $smokeConfigDir "focus_options.txt") -Value ("TargetWindow=" + $hA.ToInt64()) -Encoding ASCII
+Add-Content -Path $configPath -Value ("TargetWindow=" + $hA.ToInt64()) -Encoding ASCII
 
 # Force B to the real foreground
 [void][Win32]::ShowWindow($hB, 5)

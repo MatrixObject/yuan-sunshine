@@ -76,6 +76,7 @@ t1.cpp
 write_file_test_*.txt
 focusspoof.zip
 focusspoof_worker.log
+focusspoof/focus_options.txt
 
 # Materialized submodule content (re-init via .gitmodules instead)
 third-party/

@@ -16,7 +16,8 @@
  *   '@0' stdcall decoration so GetProcAddress("SpoofStart") resolves.
  *
  * Settings all come from the controller's config file, never the registry:
- *   %APPDATA%\SunshineWindowController\focus_options.txt
+ *   focus_options.txt next to this DLL (the controller ships it in the
+ *   same directory and writes it there)
  * each line "Name=Number". Missing keys fall back to the DLL defaults
  * listed here, so a bare injection follows the same behavior as the UI.
  *
@@ -1106,21 +1107,46 @@ static bool IsSafeProc(const void* p) {
 }
 
 /**
+ * @brief Resolve the absolute path of the controller's focus_options.txt.
+ *
+ * The file lives next to this DLL itself (the controller ships in the same
+ * directory and writes the file there), so resolving the DLL module path
+ * works for the portable package and the dev layout alike, independent of
+ * the host process's working directory and of any %APPDATA% state.
+ *
+ * @param[out] path Buffer receiving the full file path.
+ * @param size Size of the buffer.
+ * @return True when the path was resolved, false when the DLL module path
+ *         cannot be determined (callers then fall back to defaults).
+ */
+static bool ConfigFilePath(char* path, size_t size) {
+  char dir[MAX_PATH];
+  HMODULE hmod = NULL;
+  DWORD n = 0;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         (LPCSTR) &ConfigFilePath, &hmod))
+    n = GetModuleFileNameA(hmod, dir, (DWORD) sizeof(dir));
+  char* slash = (n > 0 && n < sizeof(dir)) ? strrchr(dir, '\\') : NULL;
+  if (!slash)
+    return false;
+  *slash = '\0';
+  snprintf(path, size, "%s\\focus_options.txt", dir);
+  return true;
+}
+
+/**
  * @brief Read one "name=value" switch from the controller's settings file
- * (%APPDATA%\SunshineWindowController\focus_options.txt). The companion
- * WPF controller writes this file; the registry is deliberately never
- * touched so the feature needs no registry permissions anywhere.
+ * (focus_options.txt next to this DLL). The companion WPF controller writes
+ * this file; the registry is deliberately never touched so the feature needs
+ * no registry permissions anywhere.
  * @param name Switch name, e.g. "BlockPollingApis".
  * @param def Value returned when the file or line is missing.
  * @return The stored value, or the default on any failure.
  */
 static DWORD FileDword(const char* name, DWORD def) {
-  const char* appdata = getenv("APPDATA");
-  if (!appdata || !appdata[0])
-    return def;
   char path[MAX_PATH];
-  if (snprintf(path, sizeof(path),
-               "%s\\SunshineWindowController\\focus_options.txt", appdata) <= 0)
+  if (!ConfigFilePath(path, sizeof(path)))
     return def;
   FILE* f = fopen(path, "r");
   if (!f)
@@ -1149,12 +1175,8 @@ static DWORD FileDword(const char* name, DWORD def) {
  * @return The stored value, or the default on any failure.
  */
 static ULONG_PTR FileUintPtr(const char* name, ULONG_PTR def) {
-  const char* appdata = getenv("APPDATA");
-  if (!appdata || !appdata[0])
-    return def;
   char path[MAX_PATH];
-  if (snprintf(path, sizeof(path),
-               "%s\\SunshineWindowController\\focus_options.txt", appdata) <= 0)
+  if (!ConfigFilePath(path, sizeof(path)))
     return def;
   FILE* f = fopen(path, "r");
   if (!f)

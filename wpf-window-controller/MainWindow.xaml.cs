@@ -259,9 +259,9 @@ namespace SunshineWindowController
             _settings.BaseUrl = BaseUrlBox.Text.Trim();
             _settings.Username = UsernameBox.Text.Trim();
             _settings.Password = PasswordBox.Password;
-            // 记录解析后的绝对路径，而不是原始输入（相对路径 ./sunshine.exe 无法跨进程/换目录复用）。
-            var rawPath = SunshinePathBox.Text.Trim();
-            _settings.SunshineExePath = SunshineService.ResolveExePath(rawPath) ?? rawPath;
+            // 原样保存用户输入；相对路径（如 ./sunshine.exe）在使用时以本程序所在目录解析，
+            // 因此随包目录整体挪动仍然有效，保存成绝对路径反而会让包失去便携性。
+            _settings.SunshineExePath = SunshinePathBox.Text.Trim();
             _settings.Save();
             await Task.Yield();
         }
@@ -591,7 +591,7 @@ namespace SunshineWindowController
         }
 
         /// <summary>
-        /// 将当前所有焦点伪造选项写入配置文件（focus_options.txt + settings.json）。
+        /// 将当前所有焦点伪造选项写入配置文件（focus_options.txt + SunshineWindowController.json）。
         /// </summary>
         private async void SaveConfigButton_Click(object sender, RoutedEventArgs e)
         {
