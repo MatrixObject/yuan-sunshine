@@ -255,28 +255,54 @@ static void Trace(const char* fmt, ...) {
 /**
  * @brief Build the absolute diagnostic log path for this process.
  *
- * The file always lives under %TEMP% with a FIXED file name so it is easy
- * to locate while debugging a live game; the process id is only recorded
- * inside the file content. A backslash is inserted between the temp dir and
- * the file name explicitly, because GetTempPathA is not guaranteed to
- * terminate the path with a separator.
+ * All log files collect in a "logs" subdirectory next to the DLL itself, so
+ * every injected process writes into one stable, predictable folder (e.g.
+ * <controller dir>\logs) regardless of the host's working directory; the
+ * process id is only recorded inside the file content. When the DLL module
+ * path cannot be resolved the fallback is ".\logs" relative to the process
+ * working directory. The directory is created on demand and logging stays
+ * best-effort: a failed fopen simply skips the line.
  *
  * @param[out] path Buffer receiving the full path.
  * @param size Size of the buffer.
  * @param stem File name stem (e.g. "focusspoof_worker").
  */
 static void LogPath(char* path, size_t size, const char* stem) {
-  DWORD n = GetTempPathA((DWORD)size, path);
-  if (n == 0 || n >= size) {
-    snprintf(path, size, ".\\%s.log", stem);
+  char dir[MAX_PATH];
+  HMODULE hmod = NULL;
+  DWORD n = 0;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         (LPCSTR) &LogPath, &hmod))
+    n = GetModuleFileNameA(hmod, dir, (DWORD) sizeof(dir));
+  char* slash = (n > 0 && n < sizeof(dir)) ? strrchr(dir, '\\') : NULL;
+  if (!slash) {
+    CreateDirectoryA(".\\logs", NULL);
+    snprintf(path, size, ".\\logs\\%s.log", stem);
     return;
   }
-  size_t base = strlen(path);
-  if (base > 0 && base + 1 < size && path[base - 1] != '\\') {
-    path[base++] = '\\';
-    path[base] = '\0';
-  }
-  snprintf(path + base, size - base, "%s.log", stem);
+  *slash = '\0';
+  char logdir[MAX_PATH];
+  snprintf(logdir, sizeof(logdir), "%s\\logs", dir);
+  CreateDirectoryA(logdir, NULL);
+  snprintf(path, size, "%s\\logs\\%s.log", dir, stem);
+}
+
+/**
+ * @brief Truncate the worker diagnostics file so a run always starts fresh.
+ *
+ * Called at SpoofStartImpl entry (even when the spoof is already active, so
+ * re-injecting or re-enabling into a still-running game rewrites the log
+ * instead of appending) and at worker thread start. Dlog/DiagEvent then
+ * append only within the current run; the file never accumulates across
+ * runs.
+ */
+static void ResetWorkerLog(void) {
+  char path[MAX_PATH];
+  LogPath(path, sizeof(path), "focusspoof_worker");
+  FILE* f = fopen(path, "w");
+  if (f)
+    fclose(f);
 }
 
 /**
@@ -1926,11 +1952,7 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
     return 0;
   }
 
-char path[MAX_PATH];
-  LogPath(path, sizeof(path), "focusspoof_worker");
-  FILE* f = fopen(path, "w");
-  if (f)
-    fclose(f);
+  ResetWorkerLog();
   g_workerLog = 1;
   g_diagEvents = FileDword("DiagFocusEvents", 0);
   if (g_diagEvents == 1)
@@ -2019,6 +2041,9 @@ char path[MAX_PATH];
  * @return True when accepted (not necessarily completed yet).
  */
 static BOOL SpoofStartImpl(void) {
+  /* Every start rewrites the worker log: repeated injection or re-enable
+     into a still-running game must never accumulate older runs. */
+  ResetWorkerLog();
   InterlockedExchange(&g_stop, 0);
   if (InterlockedCompareExchange(&g_state, 1, 0) == 1)
     return TRUE; /* already on */
@@ -2126,7 +2151,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
     g_realGetActiveWindow = g_exportGetActiveWindow;
     g_realGetFocus = g_exportGetFocus;
     Trace("attached");
-    CreateThread(NULL, 0, WorkerThread, 0, 0, NULL);
+    g_worker = CreateThread(NULL, 0, WorkerThread, 0, 0, NULL);
     break;
   case DLL_PROCESS_DETACH:
     InterlockedExchange(&g_stop, 1);

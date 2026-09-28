@@ -73,7 +73,7 @@ Start-Sleep -Milliseconds 800
 $fg = [Win32]::GetForegroundWindow()
 Write-Host "Foreground is now: $fg (expect B=$hB)"
 
-$la = "focusspoof_target_$($pa.Id).log"
+$la = "logs\focusspoof_target_$($pa.Id).log"
 if (Test-Path $la) {
   Write-Host "A log before injection (expect ==me: 0, because B is front):"
   Get-Content $la | Select-Object -Last 2 | ForEach-Object { Write-Host "  $_" }
@@ -121,7 +121,8 @@ else { Write-Host "FOCUS SPOOF FAILED (no me:1 after injection)" }
 #      key_blocked=1 line must appear in A's log.
 #   2. The worker reached "focus spoof active" and installed the blocking
 #      detours without crashing the process.
-$workerLog = Join-Path $env:TEMP "focusspoof_worker.log"
+# The DLL writes its worker log into a "logs" folder next to itself.
+$workerLog = Join-Path $dir "logs\focusspoof_worker.log"
 if (Test-Path $workerLog) {
   $workerLines = Get-Content $workerLog
   if ($workerLines | Where-Object { $_ -match "focus spoof active" }) {

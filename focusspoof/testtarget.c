@@ -3,7 +3,8 @@
  * @brief Win32 host app used to smoke-test focusspoof.dll injection.
  *
  * Creates a visible top-level window and pumps its message loop. Every 2 s it
- * writes a line to focusspoof_target_<pid>.log recording whether the injected
+ * writes a line to logs\focusspoof_target_<pid>.log (relative to the working
+ * directory) recording whether the injected
  * focus spoof makes GetForegroundWindow() report *this* window ("me:1") even
  * when another window holds the real foreground - which is exactly the spoof
  * the game engine relies on - and whether the injected input blocker swallowed
@@ -64,8 +65,9 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR cmd, int nCmdShow) {
   ShowWindow(g_hwnd, SW_SHOWNORMAL);
   UpdateWindow(g_hwnd);
 
+  CreateDirectoryA("logs", NULL);
   char logPath[64];
-  sprintf(logPath, "focusspoof_target_%lu.log", GetCurrentProcessId());
+  sprintf(logPath, "logs\\focusspoof_target_%lu.log", GetCurrentProcessId());
   g_log = fopen(logPath, "w");
 
   DWORD last = 0;

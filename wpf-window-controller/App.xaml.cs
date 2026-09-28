@@ -30,6 +30,9 @@ namespace SunshineWindowController
                 return;
             }
 
+            // 清理过期日志：logs 目录下超过 1 天的 focusspoof_target_*.log。
+            Services.FocusSpoof.CleanupStaleLogs();
+
             base.OnStartup(e);
         }
 

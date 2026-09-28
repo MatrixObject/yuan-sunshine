@@ -23,6 +23,45 @@ namespace SunshineWindowController.Services
                 "SunshineWindowController",
                 "focus_options.txt");
 
+        /// <summary>
+        /// 清理过期的 focusspoof 目标日志。
+        ///
+        /// DLL 把诊断日志写到自身旁边的 logs 目录，其中
+        /// focusspoof_target_&lt;pid&gt;.log 每次注入都会新增一个，会不断积累。
+        /// 控制器启动时只删除名字匹配 focusspoof_target_*.log 且最后写入时间
+        /// 超过 1 天的文件（即上次运行遗留的过期日志），其余文件一律不动。
+        /// 日志正被仍在运行的注入进程写入时删除会失败，此时静默跳过该文件
+        /// （DLL 每次写日志都会重新打开文件，之后仍会正常追加）。
+        /// 整个清理是尽力而为的操作，任何失败都不影响启动。
+        /// </summary>
+        public static void CleanupStaleLogs()
+        {
+            try
+            {
+                var dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+                if (!Directory.Exists(dir))
+                    return;
+
+                var staleBefore = DateTime.Now.AddDays(-1);
+                foreach (var file in Directory.GetFiles(dir, "focusspoof_target_*.log"))
+                {
+                    try
+                    {
+                        if (File.GetLastWriteTime(file) < staleBefore)
+                            File.Delete(file);
+                    }
+                    catch (Exception)
+                    {
+                        // 文件被占用或无权限，跳过即可。
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // 日志目录不可访问等异常情况：忽略，不影响启动。
+            }
+        }
+
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         private const ushort IMAGE_FILE_MACHINE_I386 = 0x014c;
 
@@ -236,7 +275,14 @@ namespace SunshineWindowController.Services
 
                 if (proc.ExitCode == 0)
                 {
-                    message = "注入成功：" + stdout.Trim();
+                    // LoadLibrary 对已加载的 DLL 不会重跑 DllMain：向同一进程
+                    // 重复注入（或停用后再注入）时 attach 逻辑不会执行。这里
+                    // 显式调 SpoofStart 重新启用 hook；DLL 侧的 SpoofStart
+                    // 每次都会重写 worker 日志，避免跨多次注入累加。
+                    if (!CallExport(pid, "SpoofStart", out var startMsg))
+                        message = "注入成功，但重新启用失败：" + startMsg;
+                    else
+                        message = "注入成功：" + stdout.Trim();
                     return true;
                 }
                 message = "注入失败：" + (stderr.Trim() != "" ? stderr.Trim() : "退出码 " + proc.ExitCode);
