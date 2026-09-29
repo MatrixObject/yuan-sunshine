@@ -219,3 +219,107 @@ if ($exitedA) { Write-Host "A exited cleanly (detach path OK)" }
 else { Write-Host "A HUNG on exit (detach path stuck!)"; $pa.Kill() | Out-Null }
 if ($pb.HasExited) { Write-Host "B exited cleanly" }
 else { Write-Host "B HUNG on exit"; $pb.Kill() | Out-Null }
+
+# ------------------------------------------------------------------
+# XInput API rewriting scenario: prove the gamepad-over-UDP path.
+# With XInputRewrite=1 the injected DLL serves XInputGetState from a UDP
+# snapshot instead of the (absent in this environment) virtual pad. testtarget
+# probes XInputGetState every 2 s, so a single datagram must flip its log to
+# xstate:0 xbtn:4096 (A held), and after SpoofStop the call must fall through
+# to the real API again (xstate:1167 = ERROR_DEVICE_NOT_CONNECTED).
+$baseConfig = @"
+SuspendThreadsOnPatch=1
+DisableFocusSpoof=0
+EnableSubclass=1
+BlockPollingApis=1
+BlockWmInput=1
+BlockRawInputApis=1
+BlockCursorHide=1
+BlockCursorLock=1
+"@
+$xcfg = @"
+$baseConfig
+XInputRewrite=1
+XInputUdpMode=1
+XInputUdpPort=45690
+"@
+Set-Content -Path $configPath -Value $xcfg -Encoding ASCII
+
+$pc = Start-Process -FilePath $targetExe -ArgumentList 'C' -PassThru
+Start-Sleep -Seconds 3
+$hC = Get-ProcMainWindow $pc
+Add-Content -Path $configPath -Value ("TargetWindow=" + $hC.ToInt64()) -Encoding ASCII
+
+$proc = Start-Process -FilePath $injectedll -ArgumentList @($pc.Id.ToString(), "`"$dllPath`"") `
+    -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput (Join-Path $dir "inj_out.txt") `
+    -RedirectStandardError (Join-Path $dir "inj_err.txt")
+Write-Host ("xinput: injectedll exit: " + $proc.ExitCode)
+Start-Sleep -Seconds 3
+
+$workerLog = Join-Path $dir "logs\focusspoof_worker.log"
+$lc = "logs\focusspoof_target_$($pc.Id).log"
+
+$armed = Get-Content $workerLog -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match "xinput: rewrite armed \(mode=1 port=45690\)" }
+if ($armed) {
+  Write-Host "XINPUT ARMED OK (process mode still binds fixed 127.0.0.1:45690, no PID offset)"
+} else {
+  Write-Host "XINPUT ARMED FAILED"
+  Get-Content $workerLog -ErrorAction SilentlyContinue | Select-Object -Last 8 | ForEach-Object { Write-Host "  $_" }
+}
+
+# Push one controller snapshot: A held on slot 0, packet number 1.
+$pkt = New-Object byte[] 24
+[BitConverter]::GetBytes([uint32]0x31504958).CopyTo($pkt, 0)
+[BitConverter]::GetBytes([uint32]0).CopyTo($pkt, 4)
+[BitConverter]::GetBytes([uint32]1).CopyTo($pkt, 8)
+[BitConverter]::GetBytes([uint16]0x1000).CopyTo($pkt, 12)
+$pkt[14] = 127
+$udp = New-Object System.Net.Sockets.UdpClient('127.0.0.1', 45690)
+[void]$udp.Send($pkt, $pkt.Length)
+$udp.Close()
+Write-Host "xinput: sent A-held snapshot to 127.0.0.1:45690"
+
+Start-Sleep -Seconds 4
+$recvd = Get-Content $workerLog -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match "xinput: first datagram" } | Select-Object -First 1
+if ($recvd) { Write-Host "XINPUT UDP RECV OK ($recvd)" }
+else { Write-Host "XINPUT UDP RECV FAILED (no datagram accepted)" }
+
+$got = Get-Content $lc -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match "SERVED" } | Select-Object -First 1
+if ($got) { Write-Host "XINPUT UDP STATE OK ($got)" }
+else {
+  Write-Host "XINPUT UDP STATE FAILED (no SERVED marker)"
+  Get-Content $lc -ErrorAction SilentlyContinue | Select-Object -Last 5 | ForEach-Object { Write-Host "  $_" }
+}
+
+# The undocumented extended entry (XInputGetStateEx) must be served too: many
+# titles read the pad through it, so SERVEDEX proves the second hook path.
+$gotEx = Get-Content $lc -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match "SERVEDEX" } | Select-Object -First 1
+if ($gotEx) { Write-Host "XINPUT UDP STATEEX OK ($gotEx)" }
+else { Write-Host "XINPUT UDP STATEEX NOT OBSERVED (no SERVEDEX marker)" }
+
+# Disarm: after SpoofStop the probe must fall through to the real API.
+$stop = Start-Process -FilePath $injectedll `
+    -ArgumentList @("--call", $pc.Id.ToString(), "`"$dllPath`"", "SpoofStop") `
+    -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput (Join-Path $dir "call_out.txt") `
+    -RedirectStandardError (Join-Path $dir "call_err.txt")
+Start-Sleep -Seconds 3
+$fell = Get-Content $lc -ErrorAction SilentlyContinue | Select-Object -Last 1
+if ($fell -match "xstate:1167") {
+  Write-Host "XINPUT DISARMED OK ($fell)"
+} else {
+  Write-Host "XINPUT DISARM FAILED (last: $fell)"
+}
+
+if (-not $pc.HasExited) { $pc.CloseMainWindow() | Out-Null }
+$exitedC = $pc.WaitForExit(8000)
+if (-not $exitedC) { $pc.Kill() | Out-Null }
+Write-Host "C exited cleanly"
+
+# Restore the known-good config for subsequent runs.
+Set-Content -Path $configPath -Value $baseConfig -Encoding ASCII

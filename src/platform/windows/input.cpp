@@ -14,10 +14,13 @@
 #endif
 
 // platform includes
+#include <winsock2.h>
 #include <Windows.h>
 
 // standard includes
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -28,6 +31,7 @@
 #include "misc.h"
 #include "src/config.h"
 #include "src/globals.h"
+#include "src/input.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/virtualhid_input.h"
@@ -949,6 +953,65 @@ namespace platf {
   }
 
   /**
+   * @brief Deliver a gamepad snapshot to the injected game process over UDP.
+   *
+   * Runs only when window capture mode is active AND a non-off XInput
+   * delivery mode was configured for the current stream. The destination is a
+   * fixed loopback base port for both delivery modes; the per-process aspect
+   * comes from the injected game being the only process listening on that
+   * port. The shared datagram socket is created once per process; sendto is
+   * safe to call from multiple client threads.
+   *
+   * @param nr The gamepad index to deliver.
+   * @param gamepad_state The gamepad button/axis state sent from the client.
+   */
+  static void xinput_udp_send(int nr, const gamepad_state_t &gamepad_state) {
+    // Window capture mode is active when either a capture process or a
+    // capture window was requested; mirror the snapshot to the game process.
+    if (config::video.capture_process == 0 && config::video.capture_window == 0) {
+      return;
+    }
+    const auto mode = ::input::get_xinput_delivery();
+    if (mode == ::input::xinput_delivery::off) {
+      return;
+    }
+
+    static WSADATA wsa {};
+    static SOCKET sock = INVALID_SOCKET;
+    static std::once_flag sock_once;
+    std::call_once(sock_once, [] {
+      if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        BOOST_LOG(warning) << "xinput: WSAStartup failed ["sv << WSAGetLastError() << ']';
+        return;
+      }
+      sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      if (sock == INVALID_SOCKET) {
+        BOOST_LOG(warning) << "xinput: socket failed ["sv << WSAGetLastError() << ']';
+      }
+    });
+    if (sock == INVALID_SOCKET) {
+      return;
+    }
+
+    std::uint16_t port = ::input::get_xinput_udp_base_port();
+
+    SOCKADDR_IN dst {};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(port);
+
+    static std::atomic<std::uint32_t> packet_number { 0 };
+    auto packet = ::input::make_xinput_packet(gamepad_state, static_cast<std::uint32_t>(nr), packet_number.fetch_add(1));
+    auto sent = sendto(sock, reinterpret_cast<const char *>(&packet), sizeof(packet), 0,
+                       reinterpret_cast<const sockaddr *>(&dst), sizeof(dst));
+    if (sent == SOCKET_ERROR) {
+      // Typically no listener (WSAECONNREFUSED / WSAECONNRESET) or a full
+      // buffer; the injected DLL trivially ignores a dropped snapshot.
+      BOOST_LOG(debug) << "xinput: sendto 127.0.0.1:" << (unsigned)port << " failed ["sv << WSAGetLastError() << ']';
+    }
+  }
+
+  /**
    * @brief Submit updated Sunshine gamepad state to the virtual device.
    * @param input The input context.
    * @param nr The gamepad index to update.
@@ -956,8 +1019,21 @@ namespace platf {
    */
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
     auto raw = (input_raw_t *) input.get();
+
+    // When XInput-over-UDP delivery is armed, the real snapshot is forwarded
+    // to the injected game process and the system virtual pad stays attached
+    // but idle, so no other host-side application receives the controls.
+    // The send runs first: the libvirtualhid branch below returns early, and
+    // the forwarded snapshot must reach the game regardless of the pad backend.
+    auto forwarded = gamepad_state;
+    const bool capturing = config::video.capture_process != 0 || config::video.capture_window != 0;
+    xinput_udp_send(nr, gamepad_state);
+    if (capturing && ::input::get_xinput_delivery() != ::input::xinput_delivery::off) {
+      forwarded = gamepad_state_t {};
+    }
+
     if (virtualhid::has_gamepad(raw->virtualhid, nr)) {
-      virtualhid::gamepad_update(raw->virtualhid, nr, gamepad_state);
+      virtualhid::gamepad_update(raw->virtualhid, nr, forwarded);
       return;
     }
 
@@ -976,13 +1052,13 @@ namespace platf {
     VIGEM_ERROR status;
 
     if (vigem_target_get_type(gamepad.gp.get()) == Xbox360Wired) {
-      x360_update_state(gamepad, gamepad_state);
+      x360_update_state(gamepad, forwarded);
       status = vigem_target_x360_update(vigem->client.get(), gamepad.gp.get(), gamepad.report.x360);
       if (!VIGEM_SUCCESS(status)) {
         BOOST_LOG(warning) << "Couldn't send gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
       }
     } else {
-      ds4_update_state(gamepad, gamepad_state);
+      ds4_update_state(gamepad, forwarded);
       ds4_update_ts_and_send(vigem, nr);
     }
   }

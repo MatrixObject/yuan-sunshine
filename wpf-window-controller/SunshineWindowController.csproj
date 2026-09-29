@@ -7,7 +7,12 @@
     <LangVersion>latest</LangVersion>
     <AssemblyTitle>Sunshine Window Controller</AssemblyTitle>
     <RootNamespace>SunshineWindowController</RootNamespace>
+    <ApplicationIcon>1up.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="1up.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <Reference Include="System.Net.Http" />

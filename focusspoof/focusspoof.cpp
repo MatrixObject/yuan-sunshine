@@ -6,11 +6,11 @@
  *        another window has the keyboard focus.
  *
  * Build:
- *   g++ -shared -O2 -s focusspoof.cpp -o focusspoof.dll
+ *   g++ -shared -O2 -s focusspoof.cpp -o focusspoof.dll -lws2_32
  * (or the equivalent MinGW-w64/MSYS2 UCRT64 toolchain)
  *   32-bit (WOW64 games such as Doom 3 BFG; MINGW32 toolchain):
  *     g++ -m32 -shared -O2 -s focusspoof.cpp -o focusspoof32.dll \
- *         -static-libgcc -static-libstdc++ -Wl,--kill-at
+ *         -static-libgcc -static-libstdc++ -Wl,--kill-at -lws2_32
  *   -static-libgcc/-static-libstdc++ keep the DLL free of libgcc_s_dw2-1.dll
  *   (the game process would not find it), --kill-at drops the i686
  *   '@0' stdcall decoration so GetProcAddress("SpoofStart") resolves.
@@ -42,6 +42,23 @@
  *   BlockCursorLock       (default 1) - ClipCursor confinement is refused,
  *                                     GetClipCursor reports the full
  *                                     virtual screen.
+ *   XInputRewrite         (default 0) - serve XInputGetState and the
+ *                                     extended XInputGetStateEx (by name or
+ *                                     ordinal 100/103 when the module exports
+ *                                     it) from loopback UDP snapshots pushed
+ *                                     by the host; the virtual pad stays
+ *                                     attached, so only the state read is
+ *                                     overridden; XInputSetState is hooked as
+ *                                     a pure pass-through to keep ViGEm
+ *                                     rumble feedback. The host neutralizes
+ *                                     the virtual pad while delivery is armed,
+ *                                     so only this process receives the
+ *                                     controls.
+ *   XInputUdpMode         (default 0) - informational flag kept for
+ *                                     compatibility; both modes listen on the
+ *                                     fixed XInputUdpPort (no PID-derived
+ *                                     destination).
+ *   XInputUdpPort         (default 45690) - loopback port for the snapshot stream.
  *   DisableFocusSpoof     (default 0) - load the DLL but do nothing.
  *
  * How it works, all in-process, on a delayed worker thread (loader-lock
@@ -131,8 +148,11 @@
  * Use at your own risk on titles with anti-cheat.
  */
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <tlhelp32.h>
+#include <xinput.h>
 #include <cstdint>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1586,6 +1606,419 @@ static void CursorBlockHookRestore(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* XInput API rewriting (gamepad delivered over loopback UDP)          */
+/* ------------------------------------------------------------------ */
+
+/* When "XInputRewrite"=1 the streaming host forwards the session's gamepad
+   state to THIS process over UDP instead of relying solely on the virtual
+   gamepad. The virtual pad stays attached (per the design decision: the game
+   keeps seeing a controller through the OS for every other XInput API), but
+   while delivery is armed the host writes only neutral state to it, so no
+   other host-side application receives the controls. We therefore hook the
+   APIs that carry state / feedback:
+   - XInputGetState: fresh UDP state is served from a per-controller slot;
+     the undocumented extended entry XInputGetStateEx (name or ordinal 100/103)
+     shares the same body, since many titles read the pad through it.
+     While the slot is stale the call falls through to the virtual pad so
+     gameplay never blanks out.
+   - XInputSetState: pass-through only - the virtual pad is still there, so
+     rumble keeps flowing back to the client via the existing ViGEm
+     notification path; no reverse UDP channel is needed.
+   The virtual pad must run for this mode (it answers XInputGetCapabilities /
+   XInputGetBatteryInformation / XInputEnable for every other consumer), which
+   the host guarantees by never detaching it while a session is live.
+
+   UDP layout: one datagram per controller snapshot, last-wins. The host
+   always targets the fixed loopback port (XInputUdpPort, default 45690) for
+   every delivery mode; the per-process aspect comes from this process being
+   the only one whose injection listens on that port, never from a PID-derived
+   destination address.
+   All fields are little-endian host integers (identical on x86/x64), so the
+   packed struct travels as-is. */
+
+constexpr std::uint32_t XINPUT_UDP_MAGIC = 0x31504958u;  ///< "XIP1" little-endian tag.
+constexpr unsigned XINPUT_UDP_BASE_PORT = 45690;         ///< Global-mode default port.
+constexpr unsigned XINPUT_UDP_SLOTS = 4;                 ///< XInput supports 4 controllers.
+constexpr LONG64 XINPUT_UDP_FRESH_MS = 120;              ///< Slot stays "connected" this long.
+
+#pragma pack(push, 1)
+/**
+ * @brief One controller snapshot as transported over loopback UDP.
+ */
+struct XInputUdpPacket {
+  std::uint32_t magic;        ///< XINPUT_UDP_MAGIC.
+  std::uint32_t index;        ///< XInput slot 0-3.
+  std::uint32_t packetNumber; ///< Host-side monotonic counter.
+  XINPUT_GAMEPAD gamepad;     ///< Button / trigger / stick state.
+};
+static_assert(sizeof(XInputUdpPacket) == 24, "wire layout must stay 24 bytes");
+#pragma pack(pop)
+
+/**
+ * @brief Latest known state for one XInput slot, protected by g_xinputLock.
+ */
+struct XInputSlot {
+  LONG64 timestamp;    ///< GetTickCount64() at receive time; 0 = never.
+  std::uint32_t packetNumber; ///< From the last received packet.
+  XINPUT_GAMEPAD gamepad;     ///< Last received state.
+};
+
+static volatile LONG g_xinputEnabled = 0;  ///< 1 while rewriting is live.
+static XInputSlot g_xinputSlots[XINPUT_UDP_SLOTS];  ///< Latest state per slot.
+static CRITICAL_SECTION g_xinputLock;    ///< Guards g_xinputSlots.
+static volatile LONG g_xinputLockInit = 0; ///< 1 after InitializeCriticalSection.
+static volatile LONG g_firstPkt = 0;      ///< 1 once the first datagram landed.
+static HANDLE g_xinputThread = 0;        ///< The UDP receive thread.
+
+typedef DWORD(WINAPI* FnXInputGetState)(DWORD, XINPUT_STATE*);
+typedef DWORD(WINAPI* FnXInputSetState)(DWORD, XINPUT_VIBRATION*);
+static HMODULE g_xinputModule = 0;             ///< Resolved xinput DLL, kept loaded.
+static FnXInputGetState g_xinputExportGetState = 0; ///< Original export entry.
+static FnXInputGetState g_xinputRealGetState = 0;  ///< Trampoline fall-through.
+static FnXInputSetState g_xinputExportSetState = 0; ///< Original export entry.
+static FnXInputSetState g_xinputRealSetState = 0;  ///< Trampoline fall-through.
+static FnXInputGetState g_xinputExportGetStateEx = 0; ///< Original GetStateEx entry (0 when absent).
+static FnXInputGetState g_xinputRealGetStateEx = 0;  ///< Trampoline fall-through for GetStateEx.
+static Detour g_detourXGet;  ///< XInputGetState detour record.
+static Detour g_detourXSet;  ///< XInputSetState detour record.
+static Detour g_detourXGetEx;  ///< XInputGetStateEx detour record.
+
+/**
+ * @brief Whether XInput API rewriting is enabled via the settings file
+ * ("XInputRewrite", default 0).
+ * @return True when the rewrite mode should be installed.
+ */
+static bool XInputRewriteEnabled(void) {
+  return FileDword("XInputRewrite", 0) != 0;
+}
+
+/**
+ * @brief The UDP base port from the settings file ("XInputUdpPort", default
+ * XINPUT_UDP_BASE_PORT).
+ * @return The configured base port.
+ */
+static DWORD XInputUdpPort(void) {
+  return FileDword("XInputUdpPort", XINPUT_UDP_BASE_PORT);
+}
+
+/**
+ * @brief Whether the host delivers per-process ("XInputUdpMode" 1 = process,
+ * 0 = global; default 0).
+ *
+ * Informational only: the mode no longer changes the binding port. Both modes
+ * listen on the fixed XInputUdpPort; per-process routing is achieved by only
+ * the target game's injection listening on that port.
+ * @return True for per-process delivery.
+ */
+static bool XInputUdpProcessMode(void) {
+  return FileDword("XInputUdpMode", 0) != 0;
+}
+
+/**
+ * @brief Compute the local UDP port this process listens on.
+ *
+ * Always the fixed configured port (XInputUdpPort, default 45690). The port
+ * never derives from the process ID; the host targets the same fixed port for
+ * every delivery mode.
+ * @return The local port number.
+ */
+static unsigned short XInputLocalPort(void) {
+  return (unsigned short)XInputUdpPort();
+}
+
+/**
+ * @brief Resolve the extended GetState entries (XInputGetStateEx).
+ *
+ * Many titles read the controller through the undocumented extended export
+ * instead of plain XInputGetState. It is published by name on xinput1_4 and
+ * by ordinal (100/103) on the older runtimes; a game-shipped xinput stub may
+ * expose either or neither. Returns the first one that resolves and is
+ * distinct from the plain XInputGetState entry.
+ * @param h Module to probe (already loaded).
+ * @return The GetStateEx entry, or nullptr when the module has none.
+ */
+static FnXInputGetState ResolveGetStateEx(HMODULE h) {
+  static const LPCSTR ordinals[] = {(LPCSTR)MAKEWORD(100, 0), (LPCSTR)MAKEWORD(103, 0)};
+  FnXInputGetState fx = (FnXInputGetState)GetProcAddress(h, "XInputGetStateEx");
+  if (fx && fx != g_xinputExportGetState)
+    return fx;
+  for (LPCSTR ord : ordinals) {
+    fx = (FnXInputGetState)GetProcAddress(h, ord);
+    if (fx && fx != g_xinputExportGetState)
+      return fx;
+  }
+  return nullptr;
+}
+
+/**
+ * @brief Try to bind the XInput exports of a module handle.
+ *
+ * @param h Module to probe (already loaded, kept loaded by the caller).
+ * @param who Which DLL it is, for the log.
+ * @return True when XInputGetState and XInputSetState exports were found.
+ */
+static bool ResolveFromHandle(HMODULE h, const char* who) {
+  FnXInputGetState gs =
+      (FnXInputGetState)GetProcAddress(h, "XInputGetState");
+  FnXInputSetState ss =
+      (FnXInputSetState)GetProcAddress(h, "XInputSetState");
+  if (!gs || !ss)
+    return false;
+  g_xinputModule = h;
+  g_xinputExportGetState = gs;
+  g_xinputExportSetState = ss;
+  g_xinputExportGetStateEx = ResolveGetStateEx(h);
+  Dlog("xinput: resolved %s (%p) getstateEx=%p", who, (void*)h,
+       (void*)g_xinputExportGetStateEx);
+  return true;
+}
+
+/**
+ * @brief Resolve the XInput runtime of the host process.
+ *
+ * Two passes:
+ *   1. Any XInput DLL the process has ALREADY loaded is preferred - that is
+ *      the exact instance the game's import table points at (modern titles
+ *      xinput1_4, most shipped titles xinput1_3, UWP xinput9_1_0), and
+ *      hooking it is what actually intercepts the game's calls. We never
+ *      re-load: GetModuleHandleA only returns an existing mapping.
+ *   2. When nothing is loaded yet, load the preferred modern name first and
+ *      fall back through the legacy names (xinput9_1_0, 1_2, 1_1).
+ * The chosen module is kept loaded for the process lifetime so the hook's
+ * trampoline and the pass-through pointer stay valid.
+ */
+static void ResolveXInput(void) {
+  static const char* const names[] = {
+    "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll",
+    "xinput1_2.dll", "xinput1_1.dll",
+  };
+  for (const char* name : names) {
+    HMODULE h = GetModuleHandleA(name);
+    if (h && ResolveFromHandle(h, name)) {
+      Dlog("xinput: hooking already-loaded %s", name);
+      return;
+    }
+  }
+  for (const char* name : names) {
+    HMODULE h = LoadLibraryA(name);
+    if (!h)
+      continue;
+    if (ResolveFromHandle(h, name)) {
+      Dlog("xinput: loaded %s (no preloaded XInput)", name);
+      return;
+    }
+    FreeLibrary(h);
+  }
+  Dlog("xinput: no XInput runtime found");
+}
+
+/**
+ * @brief UDP receive thread: drains controller snapshots into the slots.
+ *
+ * A blocking socket with a 250 ms select timeout keeps the thread stoppable
+ * (g_stop) without losing packets. Loopback datagrams addressed to a port
+ * nobody listens on are dropped by the OS, so the thread may also run with no
+ * host sending.
+ * @param param Unused.
+ * @return 0.
+ */
+static DWORD WINAPI XInputUdpThread(LPVOID param) {
+  (void)param;
+  WSADATA wsa;
+  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+    Dlog("xinput: WSAStartup failed %d", WSAGetLastError());
+    return 0;
+  }
+  SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (s == INVALID_SOCKET) {
+    Dlog("xinput: socket failed %d", WSAGetLastError());
+    WSACleanup();
+    return 0;
+  }
+
+  SOCKADDR_IN addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(XInputLocalPort());
+  if (bind(s, (SOCKADDR*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    Dlog("xinput: bind 127.0.0.1:%u failed %d", (unsigned)XInputLocalPort(),
+         WSAGetLastError());
+    closesocket(s);
+    WSACleanup();
+    return 0;
+  }
+  Dlog("xinput: listening on 127.0.0.1:%u", (unsigned)XInputLocalPort());
+
+  while (InterlockedExchangeAdd(&g_stop, 0) == 0) {
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(s, &rd);
+    timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 250000; /* 250 ms so the stop flag is polled regularly */
+    int r = select(0, &rd, NULL, NULL, &tv);
+    if (r == SOCKET_ERROR) {
+      if (WSAGetLastError() != WSAEINTR)
+        break;
+      continue;
+    }
+    if (r == 0)
+      continue; /* timeout: re-check g_stop */
+    if (!FD_ISSET(s, &rd))
+      continue;
+
+    SOCKADDR_IN from;
+    memset(&from, 0, sizeof(from));
+    int fromLen = sizeof(from);
+    XInputUdpPacket pkt;
+    int n = recvfrom(s, (char*)&pkt, sizeof(pkt), 0, (SOCKADDR*)&from,
+                     &fromLen);
+    if (n == (int)sizeof(pkt) && pkt.magic == XINPUT_UDP_MAGIC &&
+        pkt.index < XINPUT_UDP_SLOTS) {
+      if (g_xinputLockInit == 1) {
+        EnterCriticalSection(&g_xinputLock);
+        g_xinputSlots[pkt.index].packetNumber = pkt.packetNumber;
+        g_xinputSlots[pkt.index].gamepad = pkt.gamepad;
+        g_xinputSlots[pkt.index].timestamp = (LONG64)GetTickCount64();
+        LeaveCriticalSection(&g_xinputLock);
+      }
+      if (InterlockedExchange(&g_firstPkt, 1) == 0)
+        Dlog("xinput: first datagram slot=%u btn=%04x", pkt.index,
+             (unsigned)pkt.gamepad.wButtons);
+    }
+  }
+
+  closesocket(s);
+  WSACleanup();
+  Dlog("xinput: UDP thread exiting");
+  return 0;
+}
+
+/**
+ * @brief Hooked XInputGetState / XInputGetStateEx.
+ *
+ * While rewriting is live and the requested slot holds fresh state, the
+ * helper fills the caller's XINPUT_STATE from the last received snapshot and
+ * reports ERROR_SUCCESS; otherwise the call falls through to the resolved
+ * runtime (the still-attached virtual pad), so a stalled delivery never
+ * blanks the controller out. The extended entry has the identical calling
+ * convention, so one body serves both exports.
+ * @param dwUserIndex Controller slot 0-3.
+ * @param pState Receives the state.
+ * @return ERROR_SUCCESS on fresh data, otherwise the original API's result.
+ */
+static DWORD WINAPI MyXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState) {
+  if (g_xinputEnabled == 1 && g_xinputLockInit == 1 && pState &&
+      dwUserIndex < XINPUT_UDP_SLOTS) {
+    EnterCriticalSection(&g_xinputLock);
+    LONG64 ts = g_xinputSlots[dwUserIndex].timestamp;
+    bool fresh = ts != 0 && (GetTickCount64() - ts) < XINPUT_UDP_FRESH_MS;
+    if (fresh) {
+      pState->dwPacketNumber = g_xinputSlots[dwUserIndex].packetNumber;
+      pState->Gamepad = g_xinputSlots[dwUserIndex].gamepad;
+      LeaveCriticalSection(&g_xinputLock);
+      return ERROR_SUCCESS;
+    }
+    LeaveCriticalSection(&g_xinputLock);
+  }
+  if (!g_xinputRealGetState)
+    return ERROR_DEVICE_NOT_CONNECTED;
+  return g_xinputRealGetState(dwUserIndex, pState);
+}
+
+/**
+ * @brief Hooked XInputSetState: pass-through only.
+ *
+ * The virtual pad is deliberately kept attached in this mode, so rumble
+ * written here reaches the pad and the existing ViGEm notification path
+ * relays it back to the streaming client. No reverse UDP channel exists.
+ * @param dwUserIndex Controller slot 0-3.
+ * @param pVibration Motor levels.
+ * @return The original API's result.
+ */
+static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex,
+                                     XINPUT_VIBRATION* pVibration) {
+  if (!g_xinputRealSetState)
+    return ERROR_DEVICE_NOT_CONNECTED;
+  return g_xinputRealSetState(dwUserIndex, pVibration);
+}
+
+/**
+ * @brief Install the XInput rewrite (only when XInputRewrite=1): resolve the
+ * runtime, hook GetState/GetStateEx/SetState and start the UDP listener. Any
+ * missing piece is non-fatal and logged, so the game keeps its normal pad
+ * behavior.
+ */
+static void XInputHookInstall(void) {
+  if (!XInputRewriteEnabled()) {
+    Dlog("xinput: rewriting disabled by config");
+    return;
+  }
+
+  ResolveXInput();
+  if (!g_xinputExportGetState || !g_xinputExportSetState) {
+    Dlog("xinput: install skipped (no runtime)");
+    return;
+  }
+
+  if (g_xinputLockInit != 1) {
+    InitializeCriticalSection(&g_xinputLock);
+    InterlockedExchange(&g_xinputLockInit, 1);
+  }
+  memset(g_xinputSlots, 0, sizeof(g_xinputSlots));
+  InterlockedExchange(&g_firstPkt, 0);
+
+  bool ok = DetourInstall((void*)g_xinputExportGetState,
+                          (void*)MyXInputGetState,
+                          (void**)&g_xinputRealGetState, &g_detourXGet);
+  Dlog(ok ? "xinput: XInputGetState hooked"
+          : "xinput: XInputGetState skipped");
+  if (g_xinputExportGetStateEx) {
+    ok = DetourInstall((void*)g_xinputExportGetStateEx, (void*)MyXInputGetState,
+                       (void**)&g_xinputRealGetStateEx, &g_detourXGetEx);
+    Dlog(ok ? "xinput: XInputGetStateEx hooked"
+            : "xinput: XInputGetStateEx skipped");
+  } else {
+    Dlog("xinput: no GetStateEx export in resolved module");
+  }
+  ok = DetourInstall((void*)g_xinputExportSetState, (void*)MyXInputSetState,
+                     (void**)&g_xinputRealSetState, &g_detourXSet);
+  Dlog(ok ? "xinput: XInputSetState hooked" : "xinput: XInputSetState skipped");
+
+  g_xinputThread = CreateThread(NULL, 0, XInputUdpThread, 0, 0, NULL);
+  if (!g_xinputThread)
+    Dlog("xinput: UDP thread failed %lu", GetLastError());
+
+  InterlockedExchange(&g_xinputEnabled, 1);
+  Dlog("xinput: rewrite armed (mode=%d port=%u)",
+       XInputUdpProcessMode() ? 1 : 0, (unsigned)XInputLocalPort());
+}
+
+/**
+ * @brief Restore the XInput rewrite: stop the UDP thread, restore the detours
+ * and drop the arm flag. The resolved xinput module stays loaded for the
+ * process lifetime.
+ */
+static void XInputHookRestore(void) {
+  InterlockedExchange(&g_xinputEnabled, 0);
+  if (g_xinputThread) {
+    WaitForSingleObject(g_xinputThread, 2000);
+    CloseHandle(g_xinputThread);
+    g_xinputThread = 0;
+  }
+  DetourRestore(&g_detourXGet, (void**)&g_xinputRealGetState,
+                (void*)g_xinputExportGetState);
+  if (g_xinputExportGetStateEx) {
+    DetourRestore(&g_detourXGetEx, (void**)&g_xinputRealGetStateEx,
+                  (void*)g_xinputExportGetStateEx);
+  }
+  DetourRestore(&g_detourXSet, (void**)&g_xinputRealSetState,
+                (void*)g_xinputExportSetState);
+  Dlog("xinput: restore done");
+}
+
+/* ------------------------------------------------------------------ */
 /* Window subclass: spoof activation messages                          */
 /* ------------------------------------------------------------------ */
 
@@ -2046,6 +2479,10 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
   CursorBlockHookInstall();
   Dlog("worker: cursor-control hooks done");
 
+  Dlog("worker: installing xinput rewrite");
+  XInputHookInstall();
+  Dlog("worker: xinput rewrite done (if enabled)");
+
   Trace("focus spoof active");
   Dlog("focus spoof active");
   DumpInputRouting();
@@ -2101,6 +2538,8 @@ static BOOL SpoofStopImpl(void) {
   Dlog("stop: input-block restored");
   CursorBlockHookRestore();
   Dlog("stop: cursor-block restored");
+  XInputHookRestore();
+  Dlog("stop: xinput restore done");
   if (g_target) {
     /* Stale install is harmless (SwallowProc is pass-through when off),
        but try to restore cleanly anyway. */

@@ -107,6 +107,72 @@
                     </Setter.Value>
                 </Setter>
             </Style>
+            <Style x:Key="DarkComboBox" TargetType="ComboBox">
+                <Setter Property="Foreground" Value="White"/>
+                <Setter Property="Background" Value="#FF3F3F46"/>
+                <Setter Property="BorderBrush" Value="#FF555555"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ComboBox">
+                            <Grid>
+                                <Border x:Name="Bg" Background="{TemplateBinding Background}"
+                                        BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="2"/>
+                                <ContentPresenter Content="{TemplateBinding SelectionBoxItem}"
+                                                  ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                                  Margin="6,4,30,4" VerticalAlignment="Center"/>
+                                <ToggleButton x:Name="Toggle" Width="22" HorizontalAlignment="Right" Margin="0,1,1,1"
+                                              Focusable="False" ClickMode="Press" Background="Transparent" BorderThickness="0"
+                                              IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                    <ToggleButton.Template>
+                                        <ControlTemplate TargetType="ToggleButton">
+                                            <Border Background="Transparent">
+                                                <Path Data="M 0,0 L 5,5 L 10,0 Z" Fill="#FFCFCFCF" Stroke="#FFCFCFCF"
+                                                      HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                            </Border>
+                                        </ControlTemplate>
+                                    </ToggleButton.Template>
+                                </ToggleButton>
+                                <Popup x:Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom"
+                                       AllowsTransparency="True" PopupAnimation="Slide">
+                                    <Border Background="#FF2D2D30" BorderBrush="#FF555555" BorderThickness="1"
+                                            MinWidth="{TemplateBinding ActualWidth}" Margin="0,1,0,0">
+                                        <ScrollViewer MaxHeight="240">
+                                            <ItemsPresenter/>
+                                        </ScrollViewer>
+                                    </Border>
+                                </Popup>
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                                    <Setter TargetName="Bg" Property="BorderBrush" Value="#FF0E639C"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+                <Setter Property="ItemContainerStyle">
+                    <Setter.Value>
+                        <Style TargetType="ComboBoxItem">
+                            <Setter Property="Foreground" Value="White"/>
+                            <Setter Property="Background" Value="#FF2D2D30"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="ComboBoxItem">
+                                        <Border x:Name="Bd" Background="{TemplateBinding Background}" Padding="6,5">
+                                            <ContentPresenter/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsHighlighted" Value="True">
+                                                <Setter TargetName="Bd" Property="Background" Value="#FF0E639C"/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                        </Style>
+                    </Setter.Value>
+                </Setter>
+            </Style>
             <Style TargetType="RadioButton">
                 <Setter Property="Foreground" Value="#FFCFCFCF"/>
                 <Setter Property="VerticalAlignment" Value="Center"/>
@@ -121,9 +187,10 @@
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*"/>
                         <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
-                    <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+                    <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,8,0,8">
                         <TextBlock x:Name="TargetCountText" Text="共找到 0 个窗口" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
                         <Button x:Name="RefreshButton" Content="刷新" Margin="24,0,0,0"
                                 Padding="12,5" Click="RefreshButton_Click"
@@ -241,6 +308,9 @@
 
                     <TextBlock Grid.Row="2" Text="点击窗口只切换 Sunshine 录制目标（点击桌面切回全屏）；点击窗口右侧按钮才会注入/卸载焦点伪造。"
                                Foreground="#FF8A8A8A" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+                    <TextBlock Grid.Row="3" x:Name="StatusText" Text="就绪。" Foreground="#FFCFCFCF"
+                               TextTrimming="CharacterEllipsis" Margin="0,8,0,0"/>
                 </Grid>
             </TabItem>
 
@@ -335,6 +405,29 @@
                             </StackPanel>
                         </Border>
 
+                        <!-- XInput 手柄改写选项 -->
+                        <TextBlock Text="XInput 手柄改写选项" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                            <StackPanel>
+                                <CheckBox x:Name="XInputEnabledCheck" Tag="XInputRewrite"
+                                          Content="XInput (Xbox 手柄) 仅针对进程进行输入"
+                                          Foreground="#FFCFCFCF" IsChecked="True" Margin="0,0,0,6"
+                                          Checked="FocusOption_Changed" Unchecked="FocusOption_Changed"/>
+                                <Grid Margin="8,0,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="手柄数据的发送至 UDP 端口：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
+                                    <ComboBox Grid.Column="1" x:Name="XInputPortCombo" Width="110" Margin="6,0,0,0"
+                                              Style="{StaticResource DarkComboBox}"
+                                              VerticalContentAlignment="Center"
+                                              SelectionChanged="XInputPortCombo_SelectionChanged"/>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
                         <!-- 启动按钮 -->
                         <Button x:Name="LaunchButton" Content="启动 Sunshine" Padding="12,5"
                                 Click="LaunchButton_Click" Background="#FF3E7C17" Foreground="White" BorderThickness="0"
@@ -349,10 +442,6 @@
                             <TextBlock Text="保存/加载全部焦点伪造选项到配置文件" Foreground="#FF8A8A8A"
                                        VerticalAlignment="Center" Margin="12,0,0,0"/>
                         </StackPanel>
-
-                        <!-- 状态 -->
-                        <TextBlock x:Name="StatusText" Text="就绪。" Foreground="#FFCFCFCF"
-                                   TextTrimming="CharacterEllipsis"/>
                     </StackPanel>
                 </ScrollViewer>
             </TabItem>

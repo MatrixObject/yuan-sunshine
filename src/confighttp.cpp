@@ -1452,6 +1452,40 @@ namespace confighttp {
       }
 #endif
 
+      // XInput-over-UDP delivery is runtime-only: it rides along with the
+      // capture-window request (the injected game process is the capture
+      // target). Missing fields leave the previous mode and port untouched.
+      if (input_tree.contains("xinput_delivery")) {
+        if (!input_tree["xinput_delivery"].is_string()) {
+          bad_request(response, request, "Invalid xinput_delivery");
+          return;
+        }
+        const auto delivery = input_tree["xinput_delivery"].get<std::string>();
+        input::xinput_delivery mode;
+        if (delivery == "off") {
+          mode = input::xinput_delivery::off;
+        } else if (delivery == "global") {
+          mode = input::xinput_delivery::global;
+        } else if (delivery == "process") {
+          mode = input::xinput_delivery::process;
+        } else {
+          bad_request(response, request, "Invalid xinput_delivery");
+          return;
+        }
+
+        std::uint16_t port = input::get_xinput_udp_base_port();
+        if (input_tree.contains("xinput_port")) {
+          const auto &port_node = input_tree["xinput_port"];
+          if (!port_node.is_number_integer() || port_node.get<int>() < 1 || port_node.get<int>() > 65535) {
+            bad_request(response, request, "Invalid xinput_port");
+            return;
+          }
+          port = static_cast<std::uint16_t>(port_node.get<int>());
+        }
+
+        input::set_xinput_delivery(mode, port);
+      }
+
       config::video.capture_window = hwnd;
 #ifdef _WIN32
       // Capture the audio of the process that owns the target window so the

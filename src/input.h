@@ -219,4 +219,90 @@ namespace input {
    * @return The major and minor axis pair.
    */
   std::pair<float, float> scale_client_contact_area(const std::pair<float, float> &val, uint16_t rotation, const std::pair<float, float> &scalar);
+
+  /**
+   * @brief Destination for XInput-over-UDP gamepad delivery.
+   *
+   * The injected game process rewrites XInputGetState from loopback UDP
+   * snapshots; the virtual pad stays attached, so this only mirrors client
+   * state to the game itself.
+   */
+  enum class xinput_delivery {
+    off,  ///< No UDP delivery; the virtual pad is the only gamepad sink.
+    global,  ///< Deliver to the fixed loopback base port.
+    process,  ///< Deliver to the injected game process via the fixed loopback port.
+  };
+
+  /**
+   * @brief Mirror of the Windows XINPUT_GAMEPAD wire layout (little-endian).
+   */
+  struct xinput_gamepad_t {
+    std::uint16_t buttons;  ///< XINPUT button mask.
+    std::uint8_t left_trigger;  ///< Left trigger 0-255.
+    std::uint8_t right_trigger;  ///< Right trigger 0-255.
+    std::int16_t thumb_lx;  ///< Left stick X axis.
+    std::int16_t thumb_ly;  ///< Left stick Y axis.
+    std::int16_t thumb_rx;  ///< Right stick X axis.
+    std::int16_t thumb_ry;  ///< Right stick Y axis.
+  };
+
+  #pragma pack(push, 1)
+  /**
+   * @brief One gamepad snapshot delivered to the injected process over loopback UDP.
+   */
+  struct xinput_udp_packet {
+    std::uint32_t magic;  ///< Identifies snapshots; equals xinput_udp_magic.
+    std::uint32_t index;  ///< XInput slot the snapshot targets.
+    std::uint32_t packet_number;  ///< Monotonic host counter.
+    xinput_gamepad_t gamepad;  ///< Button / trigger / stick state.
+  };
+  #pragma pack(pop)
+
+  static_assert(sizeof(xinput_gamepad_t) == 12, "XINPUT_GAMEPAD wire size");
+  static_assert(sizeof(xinput_udp_packet) == 24, "XInput UDP wire size");
+
+  /**
+   * @brief Default loopback base port for global XInput delivery.
+   */
+  constexpr std::uint16_t xinput_udp_default_port = 45690;
+
+  /**
+   * @brief Datagram magic identifying an XInput snapshot ("XIP1" little-endian).
+   */
+  constexpr std::uint32_t xinput_udp_magic = 0x31504958u;
+
+  /**
+   * @brief Encode a Sunshine gamepad state as a raw XInput snapshot.
+   *
+   * @param gamepad_state Client gamepad button and axis state.
+   * @param index XInput slot to stamp into the packet.
+   * @param packet_number Monotonic host counter for the caller's slot.
+   * @return The wire packet ready to send over loopback UDP.
+   */
+  xinput_udp_packet make_xinput_packet(const platf::gamepad_state_t &gamepad_state, std::uint32_t index, std::uint32_t packet_number);
+
+  /**
+   * @brief Set the runtime XInput-over-UDP delivery mode and base port.
+   *
+   * The values are runtime-only and are never persisted to sunshine.conf.
+   * Both delivery modes use the same fixed loopback base port; the
+   * per-process aspect comes from the injected game being the only listener,
+   * never from a PID-derived destination.
+   *
+   * @param mode Target delivery mode.
+   * @param base_port Loopback base port used in global and process modes.
+   */
+  void set_xinput_delivery(xinput_delivery mode, std::uint16_t base_port = xinput_udp_default_port);
+
+  /**
+   * @brief Query the current XInput-over-UDP delivery mode.
+   * @return The active delivery mode.
+   */
+  xinput_delivery get_xinput_delivery();
+
+  /**
+   * @brief Query the current XInput-over-UDP base port.
+   * @return The active base port.
+   */
+  std::uint16_t get_xinput_udp_base_port();
 }  // namespace input

@@ -151,10 +151,12 @@ namespace SunshineWindowController.Services
         /// Send a request to switch the capture target. Option 1: switch to a window by handle.
         /// </summary>
         /// <param name="hwnd">Window handle of the target, or 0 for desktop.</param>
+        /// <param name="xinputDelivery">Runtime XInput-over-UDP mode: "off", "global" or "process".</param>
+        /// <param name="xinputPort">Runtime UDP base port for the XInput snapshot stream.</param>
         /// <returns>The HTTP status code returned by Sunshine.</returns>
-        public Task<HttpStatusCode> SwitchToWindowAsync(IntPtr hwnd)
+        public Task<HttpStatusCode> SwitchToWindowAsync(IntPtr hwnd, string xinputDelivery, int xinputPort)
         {
-            var body = "{\"hwnd\":" + hwnd.ToInt64() + "}";
+            var body = BuildCaptureWindowBody("hwnd", hwnd.ToInt64(), xinputDelivery, xinputPort);
             return PostCaptureWindowAsync(body);
         }
 
@@ -162,11 +164,32 @@ namespace SunshineWindowController.Services
         /// Send a request to switch the capture target. Option 2: switch by process id.
         /// </summary>
         /// <param name="pid">Process id of the target window.</param>
+        /// <param name="xinputDelivery">Runtime XInput-over-UDP mode: "off", "global" or "process".</param>
+        /// <param name="xinputPort">Runtime UDP base port for the XInput snapshot stream.</param>
         /// <returns>The HTTP status code returned by Sunshine.</returns>
-        public Task<HttpStatusCode> SwitchToPidAsync(uint pid)
+        public Task<HttpStatusCode> SwitchToPidAsync(uint pid, string xinputDelivery, int xinputPort)
         {
-            var body = "{\"pid\":" + pid + "}";
+            var body = BuildCaptureWindowBody("pid", pid, xinputDelivery, xinputPort);
             return PostCaptureWindowAsync(body);
+        }
+
+        /// <summary>
+        /// Compose the /api/capture-window JSON body with an optional XInput delivery mode.
+        /// The xinput fields are runtime-only and ride along with the capture switch.
+        /// </summary>
+        /// <param name="targetKey">"hwnd" or "pid" identifying the capture target.</param>
+        /// <param name="targetValue">Value of the capture target.</param>
+        /// <param name="xinputDelivery">XInput mode string: "off", "global" or "process".</param>
+        /// <param name="xinputPort">UDP base port for the XInput snapshot stream.</param>
+        /// <returns>The JSON request body.</returns>
+        private static string BuildCaptureWindowBody(string targetKey, long targetValue, string xinputDelivery, int xinputPort)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"").Append(targetKey).Append("\":").Append(targetValue);
+            sb.Append(",\"xinput_delivery\":\"").Append(xinputDelivery).Append('"');
+            sb.Append(",\"xinput_port\":").Append(xinputPort);
+            sb.Append('}');
+            return sb.ToString();
         }
 
         private async Task<HttpStatusCode> PostCaptureWindowAsync(string body)

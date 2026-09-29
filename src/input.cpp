@@ -2030,6 +2030,107 @@ namespace input {
   }
 
   /**
+   * @brief Destination for XInput-over-UDP gamepad delivery (runtime only).
+   */
+  xinput_delivery g_xinput_delivery { xinput_delivery::off };
+
+  /**
+   * @brief Loopback base port for XInput-over-UDP delivery (runtime only).
+   */
+  std::uint16_t g_xinput_udp_base_port { xinput_udp_default_port };
+
+  /**
+   * @brief Convert a Moonlight button mask to the XINPUT button bitmap.
+   *
+   * The XUSB/XINPUT button bit positions agree with the XINPUT_GAMEPAD
+   * wButtons layout, so the mask travels to the injected game unchanged.
+   * The HOME / MISC composite maps to the XInput guide button.
+   *
+   * @param flags Moonlight button mask.
+   * @return XINPUT-compatible button mask.
+   */
+  static std::uint16_t xinput_buttons(std::uint32_t flags) {
+    std::uint16_t buttons {};
+    if (flags & platf::DPAD_UP) {
+      buttons |= 0x0001;
+    }
+    if (flags & platf::DPAD_DOWN) {
+      buttons |= 0x0002;
+    }
+    if (flags & platf::DPAD_LEFT) {
+      buttons |= 0x0004;
+    }
+    if (flags & platf::DPAD_RIGHT) {
+      buttons |= 0x0008;
+    }
+    if (flags & platf::START) {
+      buttons |= 0x0010;
+    }
+    if (flags & platf::BACK) {
+      buttons |= 0x0020;
+    }
+    if (flags & platf::LEFT_STICK) {
+      buttons |= 0x0040;
+    }
+    if (flags & platf::RIGHT_STICK) {
+      buttons |= 0x0080;
+    }
+    if (flags & platf::LEFT_BUTTON) {
+      buttons |= 0x0100;
+    }
+    if (flags & platf::RIGHT_BUTTON) {
+      buttons |= 0x0200;
+    }
+    if (flags & (platf::HOME | platf::MISC_BUTTON)) {
+      buttons |= 0x0400;
+    }
+    if (flags & platf::A) {
+      buttons |= 0x1000;
+    }
+    if (flags & platf::B) {
+      buttons |= 0x2000;
+    }
+    if (flags & platf::X) {
+      buttons |= 0x4000;
+    }
+    if (flags & platf::Y) {
+      buttons |= 0x8000;
+    }
+
+    return buttons;
+  }
+
+  xinput_udp_packet make_xinput_packet(const platf::gamepad_state_t &gamepad_state, std::uint32_t index, std::uint32_t packet_number) {
+    xinput_udp_packet packet {};
+    packet.magic = xinput_udp_magic;
+    packet.index = index;
+    packet.packet_number = packet_number;
+
+    packet.gamepad.buttons = xinput_buttons(gamepad_state.buttonFlags);
+    packet.gamepad.left_trigger = gamepad_state.lt;
+    packet.gamepad.right_trigger = gamepad_state.rt;
+    packet.gamepad.thumb_lx = gamepad_state.lsX;
+    packet.gamepad.thumb_ly = gamepad_state.lsY;
+    packet.gamepad.thumb_rx = gamepad_state.rsX;
+    packet.gamepad.thumb_ry = gamepad_state.rsY;
+
+    return packet;
+  }
+
+  void set_xinput_delivery(xinput_delivery mode, std::uint16_t base_port) {
+    g_xinput_delivery = mode;
+    g_xinput_udp_base_port = base_port;
+  }
+
+  xinput_delivery get_xinput_delivery() {
+    return g_xinput_delivery;
+  }
+
+  std::uint16_t get_xinput_udp_base_port() {
+    return g_xinput_udp_base_port;
+  }
+
+  /**
    * @brief Determine whether an input packet originates from a gamepad.
    *
    * Touch and pen packets are not considered gamepad input because they carry
@@ -2444,6 +2545,22 @@ namespace input {
 
     bool is_gamepad_input(std::uint32_t magic) {
       return ::input::is_gamepad_input(magic);
+    }
+
+    void set_xinput_delivery(xinput_delivery mode, std::uint16_t base_port) {
+      ::input::set_xinput_delivery(mode, base_port);
+    }
+
+    xinput_delivery get_xinput_delivery() {
+      return ::input::get_xinput_delivery();
+    }
+
+    std::uint16_t get_xinput_udp_base_port() {
+      return ::input::get_xinput_udp_base_port();
+    }
+
+    xinput_udp_packet make_xinput_packet(const platf::gamepad_state_t &gamepad_state, std::uint32_t index, std::uint32_t packet_number) {
+      return ::input::make_xinput_packet(gamepad_state, index, packet_number);
     }
 
     std::size_t queued_input_packet_count(const std::shared_ptr<input_t> &input) {

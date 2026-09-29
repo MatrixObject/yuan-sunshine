@@ -20,6 +20,7 @@ namespace SunshineWindowController
         private readonly AppSettings _settings;
         private bool _isRefreshing;
         private bool _suppressSelection;
+        private bool _isLoaded;
         private int _refreshGeneration;
 
         /// <summary>定时刷新窗口列表的计时器（每 3 秒一次）。</summary>
@@ -53,6 +54,9 @@ namespace SunshineWindowController
 
             // 焦点伪造选项
             LoadFocusOptions();
+
+            // 此后下拉框的选中变化即视为用户操作并立即应用
+            _isLoaded = true;
 
             // 初始刷新窗口列表
             _ = RefreshTargetsAsync();
@@ -103,6 +107,12 @@ namespace SunshineWindowController
             BlockCursorHideCheck.IsChecked = FocusSpoof.GetOption("BlockCursorHide", _settings.BlockCursorHide ? 1 : 0) != 0;
             BlockCursorLockCheck.IsChecked = FocusSpoof.GetOption("BlockCursorLock", _settings.BlockCursorLock ? 1 : 0) != 0;
             DisableAllCheck.IsChecked = FocusSpoof.GetOption("DisableFocusSpoof", _settings.DisableAll ? 1 : 0) != 0;
+
+            // XInput 手柄改写选项（与焦点伪造选项同一配置文件）
+            XInputEnabledCheck.IsChecked = FocusSpoof.GetOption("XInputRewrite", _settings.XInputEnabled ? 1 : 0) != 0;
+            XInputPortCombo.ItemsSource = AppSettings.XInputPortPresets;
+            var savedPort = FocusSpoof.GetOption("XInputUdpPort", _settings.XInputPort);
+            XInputPortCombo.SelectedItem = AppSettings.XInputPortPresets.Contains(savedPort) ? savedPort : _settings.XInputPort;
         }
 
         /// <summary>
@@ -128,6 +138,8 @@ namespace SunshineWindowController
                         "BlockCursorHide=" + (_settings.BlockCursorHide ? 1 : 0),
                         "BlockCursorLock=" + (_settings.BlockCursorLock ? 1 : 0),
                         "DisableFocusSpoof=" + (_settings.DisableAll ? 1 : 0),
+                        "XInputRewrite=" + (_settings.XInputEnabled ? 1 : 0),
+                        "XInputUdpPort=" + _settings.XInputPort,
                     };
                     File.WriteAllLines(FocusSpoof.ConfigPath, lines);
                 }
@@ -144,7 +156,7 @@ namespace SunshineWindowController
             {
                 // 保存到配置文件（DLL 从配置文件读取）
                 FocusSpoof.SetOption(name, box.IsChecked == true ? 1 : 0);
-                
+
                 // 同时更新 AppSettings（用于持久化）
                 if (_settings != null)
                 {
@@ -186,7 +198,20 @@ namespace SunshineWindowController
                 case "DisableFocusSpoof":
                     _settings.DisableAll = value;
                     break;
+                case "XInputRewrite":
+                    _settings.XInputEnabled = value;
+                    break;
             }
+        }
+
+        /// <summary>
+        /// 从当前设置生成发送给 Sunshine /api/capture-window 的 xinput_delivery 值。
+        /// 策略固定为进程模式（仅针对被注入的目标进程），端口固定为
+        /// AppSettings.XInputPort（下拉框预设之一）。
+        /// </summary>
+        private string BuildXinputDeliveryValue()
+        {
+            return _settings.XInputEnabled ? "process" : "off";
         }
 
         private SunshineService CreateService()
@@ -479,9 +504,13 @@ namespace SunshineWindowController
 
             try
             {
+                // 桌面模式回到全屏桌面：显式关闭 XInput-over-UDP 改写，让虚拟手柄
+                // 恢复为系统唯一的输入通路；仅游戏目标才携带进程改写开关。
+                var xinputDelivery = target.IsDesktop ? "off" : BuildXinputDeliveryValue();
+                var xinputPort = _settings.XInputPort;
                 var status = target.IsDesktop
-                    ? await service.SwitchToWindowAsync(IntPtr.Zero)
-                    : await service.SwitchToPidAsync(target.Pid);
+                    ? await service.SwitchToWindowAsync(IntPtr.Zero, xinputDelivery, xinputPort)
+                    : await service.SwitchToPidAsync(target.Pid, xinputDelivery, xinputPort);
 
                 switch ((int)status)
                 {
@@ -608,6 +637,8 @@ namespace SunshineWindowController
             _settings.BlockCursorHide = BlockCursorHideCheck.IsChecked == true;
             _settings.BlockCursorLock = BlockCursorLockCheck.IsChecked == true;
             _settings.DisableAll = DisableAllCheck.IsChecked == true;
+            _settings.XInputEnabled = XInputEnabledCheck.IsChecked == true;
+            _settings.XInputPort = XInputPortCombo.SelectedItem is int port ? port : _settings.XInputPort;
 
             await SaveSettingsAsync();
             SetStatus("配置已保存到：" + FocusSpoof.ConfigPath);
@@ -635,6 +666,24 @@ namespace SunshineWindowController
             FocusSpoof.SetOption("BlockCursorHide", BlockCursorHideCheck.IsChecked == true ? 1 : 0);
             FocusSpoof.SetOption("BlockCursorLock", BlockCursorLockCheck.IsChecked == true ? 1 : 0);
             FocusSpoof.SetOption("DisableFocusSpoof", DisableAllCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("XInputRewrite", XInputEnabledCheck.IsChecked == true ? 1 : 0);
+            FocusSpoof.SetOption("XInputUdpPort", XInputPortCombo.SelectedItem is int port ? port : _settings.XInputPort);
+        }
+
+        /// <summary>
+        /// 下拉框改变 XInput UDP 端口时立即生效：写入 focus_options.txt（DLL 侧读取）
+        /// 并同步到 AppSettings 持久化，之后的游戏注入与 /api/capture-window 请求都会
+        /// 使用新端口。初始化期间（_settings 尚未加载）本事件跳过后在加载时统一应用。
+        /// </summary>
+        private void XInputPortCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (XInputPortCombo.SelectedItem is int port && _settings != null && _isLoaded)
+            {
+                _settings.XInputPort = port;
+                FocusSpoof.SetOption("XInputUdpPort", port);
+                _settings.Save();
+                SetStatus("XInput UDP 端口已切换：" + port);
+            }
         }
     }
 }

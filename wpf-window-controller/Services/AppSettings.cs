@@ -50,6 +50,17 @@ namespace SunshineWindowController.Services
         /// <summary>禁用所有焦点伪造（仅加载 DLL）</summary>
         public bool DisableAll { get; set; } = false;
 
+        // ===== XInput 手柄改写选项 =====
+
+        /// <summary>把流会话的手柄状态 UDP 推给被注入的游戏进程（仅针对该进程改写其 XInputGetState），默认开启</summary>
+        public bool XInputEnabled { get; set; } = true;
+
+        /// <summary>XInput UDP 固定端口的 5 个可选预设（下拉框选项），需与 DLL 侧 XInputUdpPort 保持一致。</summary>
+        public static readonly int[] XInputPortPresets = { 45680, 45690, 45700, 45710, 45720 };
+
+        /// <summary>XInput UDP 固定端口，DLL 侧 focus_options.txt 的 XInputUdpPort 与此一致，默认 45690</summary>
+        public int XInputPort { get; set; } = 45690;
+
         /// <summary>
         /// 设置文件路径：本程序所在目录下的 SunshineWindowController.json（便携式，
         /// 不写 %APPDATA%，随包目录整体挪动/复制时配置不丢失、不串机器）。

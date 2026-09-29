@@ -267,6 +267,70 @@ TEST(InputWindowCaptureTest, ReportsActiveWindowCaptureModeOnlyWhenConfigured) {
   config::video.capture_window = original_window;
 }
 
+TEST(InputXInputDeliveryTest, MatchesExchangeableRuntimeState) {
+  const auto original_mode = input::get_xinput_delivery();
+  const auto original_port = input::get_xinput_udp_base_port();
+
+  input::set_xinput_delivery(input::xinput_delivery::global, 46000);
+  EXPECT_EQ(input::get_xinput_delivery(), input::xinput_delivery::global);
+  EXPECT_EQ(input::get_xinput_udp_base_port(), 46000);
+
+  input::set_xinput_delivery(input::xinput_delivery::process, 45691);
+  EXPECT_EQ(input::get_xinput_delivery(), input::xinput_delivery::process);
+  EXPECT_EQ(input::get_xinput_udp_base_port(), 45691);
+
+  // Setting a mode without a port keeps the previous port and only changes the mode.
+  input::set_xinput_delivery(input::xinput_delivery::off, input::xinput_udp_default_port);
+  EXPECT_EQ(input::get_xinput_delivery(), input::xinput_delivery::off);
+  EXPECT_EQ(input::get_xinput_udp_base_port(), input::xinput_udp_default_port);
+
+  input::set_xinput_delivery(original_mode, original_port);
+}
+
+TEST(InputXInputDeliveryTest, EnforcesWireSize) {
+  EXPECT_EQ(sizeof(input::xinput_gamepad_t), 12);
+  EXPECT_EQ(sizeof(input::xinput_udp_packet), 24);
+  EXPECT_EQ(input::xinput_udp_magic, 0x31504958u);
+}
+
+TEST(InputXInputDeliveryTest, EncodesMoonlightStateAsRawXInputSnapshot) {
+  // DPAD_UP | HOME | A | B maps to XINPUT bits 0x0001 | 0x0400 | 0x1000 | 0x2000.
+  platf::gamepad_state_t state {};
+  state.buttonFlags = platf::DPAD_UP | platf::HOME | platf::A | platf::B;
+  state.lt = 200;
+  state.rt = 55;
+  state.lsX = -32768;
+  state.lsY = 123;
+  state.rsX = 0;
+  state.rsY = 32767;
+
+  const auto packet = input::make_xinput_packet(state, 2, 7);
+  EXPECT_EQ(packet.magic, input::xinput_udp_magic);
+  EXPECT_EQ(packet.index, 2);
+  EXPECT_EQ(packet.packet_number, 7);
+  EXPECT_EQ(packet.gamepad.buttons, 0x3401);
+  EXPECT_EQ(packet.gamepad.left_trigger, 200);
+  EXPECT_EQ(packet.gamepad.right_trigger, 55);
+  EXPECT_EQ(packet.gamepad.thumb_lx, -32768);
+  EXPECT_EQ(packet.gamepad.thumb_ly, 123);
+  EXPECT_EQ(packet.gamepad.thumb_rx, 0);
+  EXPECT_EQ(packet.gamepad.thumb_ry, 32767);
+}
+
+TEST(InputXInputDeliveryTest, OmitsUnpressedButtons) {
+  platf::gamepad_state_t state {};
+  state.buttonFlags = platf::DPAD_DOWN | platf::LEFT_STICK | platf::RIGHT_BUTTON | platf::MISC_BUTTON | platf::Y;
+
+  const auto packet = input::make_xinput_packet(state, 0, 0);
+  EXPECT_EQ(packet.gamepad.buttons, 0x0002 | 0x0040 | 0x0200 | 0x0400 | 0x8000);
+
+  platf::gamepad_state_t released {};
+  released.buttonFlags = 0;
+  const auto idle = input::make_xinput_packet(released, 3, 1);
+  EXPECT_EQ(idle.gamepad.buttons, 0);
+  EXPECT_EQ(idle.index, 3);
+}
+
 TEST_F(InputGamepadSessionTest, RejectsMalformedBatchablePacketsAtQueueIngress) {
   ASSERT_FALSE(task_pool.running());
   const std::shared_ptr<input::input_t> empty_input;

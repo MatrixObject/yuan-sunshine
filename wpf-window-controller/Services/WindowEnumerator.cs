@@ -57,9 +57,10 @@ namespace SunshineWindowController.Services
 
         /// <summary>
         /// 非游戏进程名黑名单（不含扩展名，大小写无关）。只要黑名覆盖得到，
-        /// 一律排除：浏览器、资源管理器、任务管理器、记事本、画图、Office/WPS、
+        /// 一律排除：资源管理器、任务管理器、记事本、画图、Office/WPS、
         /// 各类 IDE 与编辑器、游戏引擎/建模软件、终端、聊天/远程/协作工具、
-        /// 游戏平台（Steam/Epic/GOG...）等。保持此清单可随需要扩充。
+        /// 游戏平台（Steam/Epic/GOG...）等。浏览器不在黑名单内（网页游戏/流媒体页面
+        /// 也可作为串流目标）。保持此清单可随需要扩充。
         /// </summary>
         private static readonly HashSet<string> NonGameProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -69,10 +70,6 @@ namespace SunshineWindowController.Services
             // 流媒体串流 / 推流 / 直播（本身非游戏）
             "sunshine", "sunshine_console", "palstreaming", "moonlight", "obs64",
             "obs32", "slobs",
-            // 浏览器
-            "chrome", "msedge", "firefox", "iexplore", "opera", "opera_gx", "brave",
-            "vivaldi", "yandex", "qqbrowser", "sogouexplorer", "360se", "360chrome",
-            "maxthon", "centbrowser", "waterfox", "palemoon", "seamonkey", "torbrowser",
             // 系统：文件资源管理器 / 任务管理器 / shell / 服务宿主 / 设置等
             "explorer", "taskmgr", "dwm", "sihost", "dllhost", "svchost", "searchapp",
             "searchhost", "runtimebroker", "startmenuexperiencehost", "systemsettings",
@@ -152,7 +149,7 @@ namespace SunshineWindowController.Services
                     if (pid == selfPid)
                         return true;
 
-                    // 排除非游戏应用（浏览器、资源管理器、office、画图、IDE、
+                    // 排除非游戏应用（资源管理器、office、画图、IDE、
                     // 游戏引擎/建模、终端、聊天/远程、Steam/Epic 等平台...）。
                     // 解析不到进程名（无权访问/进程已退出/无所有者）也一并排除：
                     // 连进程都无法查询到，注入 DLL 基本不可能成功。

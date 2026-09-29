@@ -67,6 +67,7 @@ wpf-window-controller/obj/
 # IDE / tools
 .run/
 .agnes/
+.vs/
 
 # Local scratch / logs / archives (not source)
 *.log
@@ -80,3 +81,6 @@ focusspoof/focus_options.txt
 
 # Materialized submodule content (re-init via .gitmodules instead)
 third-party/
+
+# Release packages (distributed via gitee, not tracked in git)
+release/
