@@ -343,6 +343,35 @@ namespace SunshineWindowController
             service.Dispose();
         }
 
+        /// <summary>
+        /// 在默认浏览器中打开 Sunshine Web UI 主页。Sunshine 未运行时拒绝操作。
+        /// </summary>
+        private void OpenWebButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!SunshineService.IsRunning())
+            {
+                SetStatus("Sunshine 未运行，无法打开主页。");
+                return;
+            }
+
+            var url = BaseUrlBox.Text.Trim();
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                SetStatus("Web UI 地址无效：" + url);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo(uri.ToString()) { UseShellExecute = true });
+                SetStatus("已在浏览器中打开：" + uri);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("打开主页失败：" + ex.Message);
+            }
+        }
+
         private async Task RefreshTargetsAsync()
         {
             if (_isRefreshing)
@@ -352,8 +381,6 @@ namespace SunshineWindowController
 
             try
             {
-                SetStatus("枚举窗口...");
-
                 var spoofSnapshot = new System.Collections.Generic.Dictionary<uint, bool>(_hookStateByPid);
                 var result = await Task.Run(() =>
                 {

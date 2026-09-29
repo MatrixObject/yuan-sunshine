@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Sunshine 窗口控制器"
-        Height="700" Width="900"
+        Height="720" Width="900"
         MinHeight="450" MinWidth="650"
         Background="#FF1E1E1E"
         FontFamily="Microsoft YaHei UI, Segoe UI" FontSize="13"
@@ -306,11 +306,8 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <TextBlock Grid.Row="2" Text="点击窗口只切换 Sunshine 录制目标（点击桌面切回全屏）；点击窗口右侧按钮才会注入/卸载焦点伪造。"
-                               Foreground="#FF8A8A8A" Margin="0,8,0,0" TextWrapping="Wrap"/>
-
                     <TextBlock Grid.Row="3" x:Name="StatusText" Text="就绪。" Foreground="#FFCFCFCF"
-                               TextTrimming="CharacterEllipsis" Margin="0,8,0,0"/>
+                               TextTrimming="CharacterEllipsis" Margin="0,8,0,8"/>
                 </Grid>
             </TabItem>
 
@@ -318,9 +315,18 @@
             <TabItem Header="设置" Style="{StaticResource DarkTabItem}">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="16">
+                        <!-- 启动按钮 -->
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                            <Button x:Name="LaunchButton" Content="启动 Sunshine" Padding="12,5"
+                                    Click="LaunchButton_Click" Background="#FF3E7C17" Foreground="White" BorderThickness="0"
+                                    Width="140" Height="36"/>
+                            <Button x:Name="OpenWebButton" Content="打开 Sunshine 主页" Padding="12,5" Margin="8,0,0,0" Height="36"
+                                    Click="OpenWebButton_Click" Background="#FF0E639C" Foreground="White" BorderThickness="0"/>
+                        </StackPanel>
+
                         <!-- 连接设置 -->
-                        <TextBlock Text="连接设置" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
-                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                        <TextBlock Text="连接设置" FontWeight="Bold" Foreground="White" Margin="0,10,0,0"/>
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12,8,8,8" Margin="0,0,0,12">
                             <StackPanel>
                                 <Grid>
                                     <Grid.ColumnDefinitions>
@@ -347,7 +353,7 @@
                                 </Grid>
                                 <Grid Margin="0,8,0,0">
                                     <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="140"/>
+                                        <ColumnDefinition Width="148"/>
                                         <ColumnDefinition Width="*"/>
                                     </Grid.ColumnDefinitions>
                                     <TextBlock Grid.Column="0" Text="用户名 / 密码：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
@@ -363,7 +369,7 @@
 
                         <!-- 焦点伪造选项 -->
                         <TextBlock Text="焦点伪造选项" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
-                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12,8,8,8" Margin="0,0,0,12">
                             <StackPanel>
                                 <CheckBox x:Name="SuspendOnPatchCheck" Tag="SuspendThreadsOnPatch"
                                           Content="打补丁时冻结线程"
@@ -407,7 +413,7 @@
 
                         <!-- XInput 手柄改写选项 -->
                         <TextBlock Text="XInput 手柄改写选项" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
-                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                        <Border Background="#FF2D2D30" CornerRadius="4" Padding="12,8,8,8" Margin="0,0,0,12">
                             <StackPanel>
                                 <CheckBox x:Name="XInputEnabledCheck" Tag="XInputRewrite"
                                           Content="XInput (Xbox 手柄) 仅针对进程进行输入"
@@ -419,7 +425,7 @@
                                         <ColumnDefinition Width="Auto"/>
                                         <ColumnDefinition Width="*"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="手柄数据的发送至 UDP 端口：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
+                                    <TextBlock Text="手柄按键发送至 UDP 端口：" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
                                     <ComboBox Grid.Column="1" x:Name="XInputPortCombo" Width="110" Margin="6,0,0,0"
                                               Style="{StaticResource DarkComboBox}"
                                               VerticalContentAlignment="Center"
@@ -427,11 +433,6 @@
                                 </Grid>
                             </StackPanel>
                         </Border>
-
-                        <!-- 启动按钮 -->
-                        <Button x:Name="LaunchButton" Content="启动 Sunshine" Padding="12,5"
-                                Click="LaunchButton_Click" Background="#FF3E7C17" Foreground="White" BorderThickness="0"
-                                HorizontalAlignment="Left" Width="140" Margin="0,0,0,8"/>
 
                         <!-- 配置保存/加载 -->
                         <StackPanel Orientation="Horizontal" Margin="0,4,0,8">
