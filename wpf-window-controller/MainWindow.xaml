@@ -192,9 +192,11 @@
 
                     <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,8,0,8">
                         <TextBlock x:Name="TargetCountText" Text="共找到 0 个窗口" Foreground="#FFCFCFCF" VerticalAlignment="Center"/>
-                        <Button x:Name="RefreshButton" Content="刷新" Margin="24,0,0,0"
+                        <Button x:Name="RefreshButton" Content="刷新列表" Margin="24,0,0,0"
                                 Padding="12,5" Click="RefreshButton_Click"
                                 Background="#FF0E639C" Foreground="White" BorderThickness="0"/>
+                        <Button Content="PIN" Padding="12,5" Margin="8,0,0,0" Height="36"
+                                    Click="OpenPinButton_Click" Background="#FF0E639C" Foreground="White" BorderThickness="0"/>
                     </StackPanel>
 
                     <ListBox Grid.Row="1" x:Name="TargetList"

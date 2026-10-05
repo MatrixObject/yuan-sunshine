@@ -1,14 +1,18 @@
 using System;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Interop;
 using System.Windows.Media.Imaging;
 using SunshineWindowController.Models;
 using SunshineWindowController.Services;
+using Forms = System.Windows.Forms;
 
 namespace SunshineWindowController
 {
@@ -17,6 +21,9 @@ namespace SunshineWindowController
     /// </summary>
     public partial class MainWindow : Window
     {
+        /// <summary>Sunshine Web UI 的 PIN 页路径（服务端路由 ^/pin/?$）。</summary>
+        private const string SunshinePinPath = "/pin";
+
         private readonly AppSettings _settings;
         private bool _isRefreshing;
         private bool _suppressSelection;
@@ -32,6 +39,24 @@ namespace SunshineWindowController
         /// <summary>每个进程当前的 hook 状态（pid -> hooked）。用于在窗口列表刷新后恢复按钮文本。</summary>
         private readonly System.Collections.Generic.Dictionary<uint, bool> _hookStateByPid =
             new System.Collections.Generic.Dictionary<uint, bool>();
+
+        /// <summary>系统托盘图标，常驻提供打开主页 / PIN 页 / 显示主窗口 / 退出。</summary>
+        private Forms.NotifyIcon _trayIcon;
+
+        /// <summary>托盘图标右键菜单。</summary>
+        private Forms.ContextMenuStrip _trayMenu;
+
+        /// <summary>正在真正退出（用于区分"关窗口=隐藏到托盘"与"退出程序"）。</summary>
+        private bool _isExiting;
+
+        /// <summary>是否已经提示过"窗口已隐藏到托盘"。</summary>
+        private bool _trayHintShown;
+
+        /// <summary>窗口消息钩子，用于接收其它实例发来的"显示主窗口"请求。</summary>
+        private HwndSource _hwndSource;
+
+        /// <summary>"显示主窗口"自定义窗口消息号。</summary>
+        private uint _showMainWindowMessage;
 
         public ObservableCollection<CaptureTarget> Targets { get; } = new ObservableCollection<CaptureTarget>();
 
@@ -55,6 +80,9 @@ namespace SunshineWindowController
             // 焦点伪造选项
             LoadFocusOptions();
 
+            // 托盘图标与右键菜单
+            InitializeTrayIcon();
+
             // 此后下拉框的选中变化即视为用户操作并立即应用
             _isLoaded = true;
 
@@ -69,6 +97,169 @@ namespace SunshineWindowController
             _refreshTimer.Tick += RefreshTimer_Tick;
             _refreshTimer.Start();
         }
+
+        /// <summary>
+        /// 建立托盘图标与右键菜单：打开 YuanSunshine（Web UI 主页）、PIN（Web UI 的 PIN 页）、
+        /// 显示主窗口、退出。
+        /// </summary>
+        private void InitializeTrayIcon()
+        {
+            _trayMenu = new Forms.ContextMenuStrip();
+            _trayMenu.Items.Add("打开 YuanSunshine", null, (s, e) => OpenSunshineWeb());
+            _trayMenu.Items.Add("PIN", null, (s, e) => OpenSunshineWeb(SunshinePinPath));
+
+            _trayMenu.Items.Add(new Forms.ToolStripSeparator());
+
+            _trayMenu.Items.Add("显示主窗口", null, (s, e) => ShowMainWindow());
+            _trayMenu.Items.Add("退出", null, (s, e) => ExitApplication());
+
+            _trayIcon = new Forms.NotifyIcon
+            {
+                Icon = LoadTrayIcon(),
+                Text = "Sunshine 窗口控制器",
+                ContextMenuStrip = _trayMenu,
+                Visible = true,
+            };
+            _trayIcon.DoubleClick += (s, e) => ShowMainWindow();
+        }
+
+        /// <summary>
+        /// 取托盘图标：优先使用本程序自身嵌入的图标，其次 1up.ico，最后用系统默认图标。
+        /// </summary>
+        /// <returns>可用的托盘图标。</returns>
+        private static System.Drawing.Icon LoadTrayIcon()
+        {
+            try
+            {
+                var exe = Assembly.GetExecutingAssembly().Location;
+                var icon = System.Drawing.Icon.ExtractAssociatedIcon(exe);
+                if (icon != null)
+                    return icon;
+            }
+            catch (Exception)
+            {
+                // 继续尝试 1up.ico
+            }
+
+            try
+            {
+                var icoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "1up.ico");
+                if (File.Exists(icoPath))
+                    return new System.Drawing.Icon(icoPath);
+            }
+            catch (Exception)
+            {
+                // 继续使用系统默认图标
+            }
+
+            return System.Drawing.SystemIcons.Application;
+        }
+
+        /// <summary>
+        /// 从托盘或其它实例请求显示主窗口：恢复显示并置前。
+        /// </summary>
+        private void ShowMainWindow()
+        {
+            Dispatcher.Invoke(() =>
+            {
+                if (!IsVisible)
+                    Show();
+
+                if (WindowState == WindowState.Minimized)
+                    WindowState = WindowState.Normal;
+
+                Activate();
+            });
+        }
+
+        /// <summary>
+        /// 真正退出程序：隐藏并释放托盘图标后关闭应用程序。
+        /// </summary>
+        private void ExitApplication()
+        {
+            _isExiting = true;
+
+            try
+            {
+                _trayIcon.Visible = false;
+                _trayIcon.Dispose();
+                _trayMenu.Dispose();
+            }
+            catch (Exception)
+            {
+                // 图标已释放等情况忽略
+            }
+
+            Application.Current.Shutdown();
+        }
+
+        /// <summary>
+        /// 关闭窗口时隐藏到托盘而不是退出程序；真正退出走托盘菜单的"退出"。
+        /// </summary>
+        /// <param name="e">关闭事件参数。</param>
+        protected override void OnClosing(CancelEventArgs e)
+        {
+            if (!_isExiting)
+            {
+                e.Cancel = true;
+                Hide();
+
+                if (!_trayHintShown)
+                {
+                    _trayHintShown = true;
+                    try
+                    {
+                        _trayIcon.ShowBalloonTip(3000, "Sunshine 窗口控制器",
+                            "已隐藏到托盘：右键托盘图标可打开 sunshine 主页、PIN 页、显示主窗口或退出。",
+                            Forms.ToolTipIcon.Info);
+                    }
+                    catch (Exception)
+                    {
+                        // 气泡提示失败不影响隐藏
+                    }
+                }
+
+                return;
+            }
+
+            base.OnClosing(e);
+        }
+
+        /// <summary>
+        /// 窗口句柄创建后挂上消息钩子，接收其它实例的"显示主窗口"请求。
+        /// </summary>
+        /// <param name="e">事件参数。</param>
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+
+            _showMainWindowMessage = RegisterWindowMessage(App.ShowMainWindowMessageName);
+            _hwndSource = HwndSource.FromHwnd(new WindowInteropHelper(this).Handle);
+            _hwndSource?.AddHook(WindowMessageHook);
+        }
+
+        /// <summary>
+        /// 窗口消息钩子：处理"显示主窗口"自定义消息。
+        /// </summary>
+        /// <param name="hwnd">窗口句柄。</param>
+        /// <param name="msg">消息号。</param>
+        /// <param name="wParam">消息参数。</param>
+        /// <param name="lParam">消息参数。</param>
+        /// <param name="handled">是否已处理。</param>
+        /// <returns>处理结果。</returns>
+        private IntPtr WindowMessageHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (_showMainWindowMessage != 0 && (uint)msg == _showMainWindowMessage)
+            {
+                ShowMainWindow();
+                handled = true;
+            }
+
+            return IntPtr.Zero;
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern uint RegisterWindowMessage(string message);
 
         /// <summary>
         /// 定时刷新窗口列表：窗口不活跃（失去焦点或最小化）、用户正按住鼠标交互、
@@ -344,31 +535,57 @@ namespace SunshineWindowController
         }
 
         /// <summary>
-        /// 在默认浏览器中打开 Sunshine Web UI 主页。Sunshine 未运行时拒绝操作。
+        /// "打开 Sunshine 主页"按钮（设置页与录制目标页各一处，共用本处理器）。
         /// </summary>
+        /// <param name="sender">事件源。</param>
+        /// <param name="e">事件参数。</param>
         private void OpenWebButton_Click(object sender, RoutedEventArgs e)
+        {
+            OpenSunshineWeb();
+        }
+
+        /// <summary>
+        /// 录制目标页的"PIN"按钮：打开 Sunshine Web UI 的 PIN 页。
+        /// </summary>
+        /// <param name="sender">事件源。</param>
+        /// <param name="e">事件参数。</param>
+        private void OpenPinButton_Click(object sender, RoutedEventArgs e)
+        {
+            OpenSunshineWeb(SunshinePinPath);
+        }
+
+        /// <summary>
+        /// 在默认浏览器中打开 Sunshine Web UI（主页或 PIN 页）。Sunshine 未运行时弹窗提示。
+        /// </summary>
+        /// <param name="relativePath">相对 Web UI 根的路径（如 /pin）；为空表示打开主页。</param>
+        private void OpenSunshineWeb(string relativePath = null)
         {
             if (!SunshineService.IsRunning())
             {
-                SetStatus("Sunshine 未运行，无法打开主页。");
+                MessageBox.Show(this, "未检测到 Sunshine 正在运行，请先启动 Sunshine。",
+                    "Sunshine 窗口控制器", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
-            var url = BaseUrlBox.Text.Trim();
-            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            var baseUrl = BaseUrlBox.Text.Trim();
+            if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri))
             {
-                SetStatus("Web UI 地址无效：" + url);
+                MessageBox.Show(this, "Web UI 地址无效：" + baseUrl,
+                    "Sunshine 窗口控制器", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
+
+            var target = string.IsNullOrEmpty(relativePath) ? baseUri : new Uri(baseUri, relativePath);
 
             try
             {
-                Process.Start(new ProcessStartInfo(uri.ToString()) { UseShellExecute = true });
-                SetStatus("已在浏览器中打开：" + uri);
+                Process.Start(new ProcessStartInfo(target.ToString()) { UseShellExecute = true });
+                SetStatus("已在浏览器中打开：" + target);
             }
             catch (Exception ex)
             {
-                SetStatus("打开主页失败：" + ex.Message);
+                MessageBox.Show(this, "打开 Sunshine 主页失败：" + ex.Message,
+                    "Sunshine 窗口控制器", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
 
