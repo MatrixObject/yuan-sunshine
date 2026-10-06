@@ -34,6 +34,7 @@
 
 // local includes
 #include "src/config.h"
+#include "src/globals.h"
 #include "src/input.h"
 #include "src/platform/virtualhid_input.h"
 
@@ -51,6 +52,8 @@ namespace {
   constexpr std::uint16_t VKEY_SPACE = 0x20;
   constexpr std::uint16_t VKEY_A = 0x41;
   constexpr std::uint16_t VKEY_B = 0x42;
+  constexpr std::uint16_t VKEY_N = 0x4E;
+  constexpr std::uint16_t VKEY_O = 0x4F;
   constexpr std::uint16_t VKEY_Z = 0x5A;
   constexpr std::uint16_t VKEY_LWIN = 0x5B;
   constexpr std::uint16_t VKEY_RWIN = 0x5C;
@@ -831,6 +834,44 @@ TEST_F(KeyboardPassthroughTest, SwallowsDisplaySwitchShortcutWhileAllModifiersAr
   press(VKEY_A, all);
   release(VKEY_A, all);
   EXPECT_EQ(taken(), (std::vector<std::string> {pressed(VKEY_A), released(VKEY_A)}));
+}
+
+TEST_F(KeyboardPassthroughTest, CursorKeysSetVisibilityInsteadOfToggling) {
+  const bool original_display_cursor = display_cursor;
+
+  press(VKEY_LCONTROL, MODIFIER_CTRL);
+  press(VKEY_LMENU, MODIFIER_CTRL | MODIFIER_ALT);
+  press(VKEY_LSHIFT, MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT);
+  ASSERT_FALSE(taken().empty());
+
+  const std::uint8_t all = MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT;
+
+  // N hides the cursor and O shows it again. Neither key reaches the host.
+  display_cursor = true;
+  press(VKEY_N, all);
+  EXPECT_FALSE(display_cursor);
+  EXPECT_TRUE(taken().empty());
+
+  press(VKEY_O, all);
+  EXPECT_TRUE(display_cursor);
+  EXPECT_TRUE(taken().empty());
+
+  // Each key is idempotent: repeating it does not flip the state back.
+  press(VKEY_O, all);
+  EXPECT_TRUE(display_cursor);
+  press(VKEY_N, all);
+  EXPECT_FALSE(display_cursor);
+  press(VKEY_N, all);
+  EXPECT_FALSE(display_cursor);
+  EXPECT_TRUE(taken().empty());
+
+  release(VKEY_N, all);
+  release(VKEY_O, all);
+  release(VKEY_LSHIFT, MODIFIER_CTRL | MODIFIER_ALT);
+  release(VKEY_LMENU, MODIFIER_CTRL);
+  release(VKEY_LCONTROL, 0);
+
+  display_cursor = original_display_cursor;
 }
 
 TEST_F(KeyboardPassthroughTest, DeliversKeysThroughTheVirtualKeyboard) {

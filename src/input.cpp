@@ -420,6 +420,10 @@ namespace input {
 
   /**
    * @brief Apply shortcut based on VKEY
+   *
+   * Cursor visibility is driven by two distinct keys so the client can set the state directly
+   * instead of toggling it: VKEY_O shows the cursor and VKEY_N hides it.
+   *
    * @param keyCode The VKEY code
    * @return 0 if no shortcut applied, > 0 if shortcut applied.
    */
@@ -435,8 +439,13 @@ namespace input {
     }
 
     switch (keyCode) {
+      case 0x4F /* VKEY_O */:
+        // Show the cursor.
+        display_cursor = true;
+        return 1;
       case 0x4E /* VKEY_N */:
-        display_cursor = !display_cursor;
+        // Hide the cursor.
+        display_cursor = false;
         return 1;
     }
 
