@@ -282,6 +282,20 @@ namespace input {
   xinput_udp_packet make_xinput_packet(const platf::gamepad_state_t &gamepad_state, std::uint32_t index, std::uint32_t packet_number);
 
   /**
+   * @brief Determine whether a gamepad snapshot carries any input at all.
+   *
+   * Moonlight clients report a pad only when it changes, so a held stick or button
+   * produces silence on the wire. Snapshots that carry input must be republished by
+   * the host until the client reports a new state, otherwise the injected XInput
+   * rewrite expires the slot and the game falls back to an idle pad. An all-zero
+   * snapshot needs no republishing: it is exactly what the idle virtual pad reports.
+   *
+   * @param gamepad_state Client gamepad button and axis state.
+   * @return True when a button, trigger, or stick is away from its rest position.
+   */
+  bool gamepad_state_held(const platf::gamepad_state_t &gamepad_state);
+
+  /**
    * @brief Set the runtime XInput-over-UDP delivery mode and base port.
    *
    * The values are runtime-only and are never persisted to sunshine.conf.

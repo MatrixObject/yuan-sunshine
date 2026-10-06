@@ -18,7 +18,9 @@
 #include <Windows.h>
 
 // standard includes
+#include <array>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -953,29 +955,46 @@ namespace platf {
   }
 
   /**
-   * @brief Deliver a gamepad snapshot to the injected game process over UDP.
+   * @brief Cadence at which a parked gamepad snapshot is republished.
    *
-   * Runs only when window capture mode is active AND a non-off XInput
-   * delivery mode was configured for the current stream. The destination is a
-   * fixed loopback base port for both delivery modes; the per-process aspect
-   * comes from the injected game being the only process listening on that
-   * port. The shared datagram socket is created once per process; sendto is
-   * safe to call from multiple client threads.
-   *
-   * @param nr The gamepad index to deliver.
-   * @param gamepad_state The gamepad button/axis state sent from the client.
+   * Moonlight clients report a pad only when it changes, so holding a stick or a
+   * button steady leaves the wire silent. The injected XInput rewrite treats that
+   * silence as a stalled delivery once its freshness window elapses and falls back
+   * to the system virtual pad, which this delivery mode deliberately feeds a neutral
+   * state; the game would therefore see a single update followed by an idle pad
+   * again, and the character stops moving while the pad is still held. Republishing
+   * the parked snapshot keeps the rewrite's slot fresh for as long as the pad carries
+   * input. The cadence stays well below the rewrite's freshness window so that a late
+   * wake-up can never blank the controller.
    */
-  static void xinput_udp_send(int nr, const gamepad_state_t &gamepad_state) {
+  static constexpr auto xinput_keepalive_interval = 40ms;
+
+  /**
+   * @brief Determine whether snapshots should reach the injected process at all.
+   *
+   * @return True while a process or window capture is selected and the XInput
+   * delivery mode for the current stream is not off.
+   */
+  static bool xinput_delivery_ready() {
     // Window capture mode is active when either a capture process or a
     // capture window was requested; mirror the snapshot to the game process.
     if (config::video.capture_process == 0 && config::video.capture_window == 0) {
-      return;
+      return false;
     }
-    const auto mode = ::input::get_xinput_delivery();
-    if (mode == ::input::xinput_delivery::off) {
-      return;
-    }
+    return ::input::get_xinput_delivery() != ::input::xinput_delivery::off;
+  }
 
+  /**
+   * @brief Send one controller snapshot to the injected process without any gating.
+   *
+   * The shared datagram socket is created once per process; sendto is safe to
+   * call from multiple client threads.
+   *
+   * @param nr The gamepad index to deliver.
+   * @param gamepad_state The gamepad button/axis state sent from the client.
+   * @param packet_number Packet number stamped into the snapshot for this slot.
+   */
+  static void xinput_udp_emit(int nr, const gamepad_state_t &gamepad_state, std::uint32_t packet_number) {
     static WSADATA wsa {};
     static SOCKET sock = INVALID_SOCKET;
     static std::once_flag sock_once;
@@ -1000,15 +1019,146 @@ namespace platf {
     dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     dst.sin_port = htons(port);
 
-    static std::atomic<std::uint32_t> packet_number { 0 };
-    auto packet = ::input::make_xinput_packet(gamepad_state, static_cast<std::uint32_t>(nr), packet_number.fetch_add(1));
-    auto sent = sendto(sock, reinterpret_cast<const char *>(&packet), sizeof(packet), 0,
-                       reinterpret_cast<const sockaddr *>(&dst), sizeof(dst));
+    auto packet = ::input::make_xinput_packet(gamepad_state, static_cast<std::uint32_t>(nr), packet_number);
+    auto sent = sendto(sock, reinterpret_cast<const char *>(&packet), sizeof(packet), 0, reinterpret_cast<const sockaddr *>(&dst), sizeof(dst));
     if (sent == SOCKET_ERROR) {
       // Typically no listener (WSAECONNREFUSED / WSAECONNRESET) or a full
       // buffer; the injected DLL trivially ignores a dropped snapshot.
-      BOOST_LOG(debug) << "xinput: sendto 127.0.0.1:" << (unsigned)port << " failed ["sv << WSAGetLastError() << ']';
+      BOOST_LOG(debug) << "xinput: sendto 127.0.0.1:" << (unsigned) port << " failed ["sv << WSAGetLastError() << ']';
     }
+  }
+
+  /**
+   * @brief One gamepad snapshot that has to outlive the client's silence.
+   */
+  struct xinput_keepalive_slot_t {
+    bool held {false};  ///< True while the snapshot carries input worth repeating.
+    gamepad_state_t state {};  ///< Snapshot last handed to the injected process.
+    std::uint32_t packet_number {0};  ///< Next packet number stamped for this slot.
+  };
+
+  /**
+   * @brief Republisher that keeps the injected rewrite's freshness window fed.
+   *
+   * The thread starts with the first snapshot that carries input and retires as
+   * soon as every pad returns to rest, so no background thread lingers while input
+   * is idle. Republishing is done from this dedicated thread rather than from the
+   * task pool because the pool runs on a single worker whose timing is not
+   * guaranteed to stay inside the rewrite's freshness window.
+   */
+  struct xinput_keepalive_t {
+    std::mutex lock;  ///< Guards every member declared below it.
+    std::condition_variable wake;  ///< Releases the republish wait during shutdown.
+    bool stop {false};  ///< True once shutdown has begun.
+    bool started {false};  ///< True while the republish thread below is running.
+    std::thread thread;  ///< Republish thread, joined by the destructor.
+    std::array<xinput_keepalive_slot_t, MAX_GAMEPADS> slots {};  ///< Per-gamepad snapshots.
+
+    /**
+     * @brief Stop and join the republish thread before the guarded state dies.
+     */
+    ~xinput_keepalive_t() {
+      {
+        std::lock_guard<std::mutex> guard {lock};
+        stop = true;
+      }
+      wake.notify_all();
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+
+    /**
+     * @brief Republish held snapshots until every pad returns to rest.
+     *
+     * A whole pass runs with the mutex held so that a republished snapshot can
+     * never overwrite a newer one that a client packet delivered in the meantime.
+     * Retiring clears the started flag under that same mutex, so the call parking
+     * the next held snapshot starts a replacement without racing this thread.
+     */
+    void run() {
+      std::unique_lock<std::mutex> guard {lock};
+      while (!stop) {
+        if (!any_held()) {
+          started = false;
+          return;
+        }
+
+        if (xinput_delivery_ready()) {
+          for (std::size_t nr = 0; nr < slots.size(); ++nr) {
+            auto &slot = slots[nr];
+            if (slot.held) {
+              xinput_udp_emit(static_cast<int>(nr), slot.state, slot.packet_number++);
+            }
+          }
+        }
+
+        wake.wait_for(guard, xinput_keepalive_interval, [this] {
+          return stop;
+        });
+      }
+    }
+
+    /**
+     * @brief Determine whether any gamepad currently carries input.
+     *
+     * @return True when at least one snapshot is worth republishing.
+     */
+    bool any_held() const {
+      for (const auto &slot : slots) {
+        if (slot.held) {
+          return true;
+        }
+      }
+      return false;
+    }
+  };
+
+  /**
+   * @brief The single republisher shared by every gamepad of this process.
+   */
+  static xinput_keepalive_t xinput_keepalive;
+
+  /**
+   * @brief Deliver a gamepad snapshot to the injected game process over UDP.
+   *
+   * Runs only when window capture mode is active AND a non-off XInput
+   * delivery mode was configured for the current stream. The destination is a
+   * fixed loopback base port for both delivery modes; the per-process aspect
+   * comes from the injected game being the only process listening on that
+   * port. The snapshot is also parked for the republish thread, which keeps
+   * refreshing the injected rewrite while the pad stays held so that the game
+   * never sees the state expire back to the idle virtual pad.
+   *
+   * @param nr The gamepad index to deliver.
+   * @param gamepad_state The gamepad button/axis state sent from the client.
+   */
+  static void xinput_udp_send(int nr, const gamepad_state_t &gamepad_state) {
+    if (!xinput_delivery_ready() || nr < 0 || nr >= MAX_GAMEPADS) {
+      return;
+    }
+
+    std::lock_guard<std::mutex> guard {xinput_keepalive.lock};
+
+    auto &slot = xinput_keepalive.slots[nr];
+    slot.state = gamepad_state;
+    slot.held = ::input::gamepad_state_held(gamepad_state);
+
+    xinput_udp_emit(nr, gamepad_state, slot.packet_number++);
+
+    if (!slot.held || xinput_keepalive.started) {
+      // An idle snapshot needs no repetition, and a running republisher already
+      // polls this state at the republish cadence.
+      return;
+    }
+    if (xinput_keepalive.thread.joinable()) {
+      // Reap the previous run, which retired once the pads returned to rest. It
+      // can only retire while holding this mutex, so the join cannot block on it.
+      xinput_keepalive.thread.join();
+    }
+    std::thread republisher {&xinput_keepalive_t::run, &xinput_keepalive};
+    xinput_keepalive.thread = std::move(republisher);
+    xinput_keepalive.started = true;
   }
 
   /**

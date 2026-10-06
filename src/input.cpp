@@ -2117,6 +2117,16 @@ namespace input {
     return packet;
   }
 
+  bool gamepad_state_held(const platf::gamepad_state_t &gamepad_state) {
+    return gamepad_state.buttonFlags != 0 ||
+           gamepad_state.lt != 0 ||
+           gamepad_state.rt != 0 ||
+           gamepad_state.lsX != 0 ||
+           gamepad_state.lsY != 0 ||
+           gamepad_state.rsX != 0 ||
+           gamepad_state.rsY != 0;
+  }
+
   void set_xinput_delivery(xinput_delivery mode, std::uint16_t base_port) {
     g_xinput_delivery = mode;
     g_xinput_udp_base_port = base_port;

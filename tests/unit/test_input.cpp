@@ -331,6 +331,43 @@ TEST(InputXInputDeliveryTest, OmitsUnpressedButtons) {
   EXPECT_EQ(idle.index, 3);
 }
 
+TEST(InputXInputDeliveryTest, DetectsEverySnapshotThatMustBeRepublished) {
+  // An untouched pad matches what the idle virtual pad reports, so it is the only
+  // snapshot the host may let the injected rewrite expire.
+  platf::gamepad_state_t idle {};
+  EXPECT_FALSE(input::gamepad_state_held(idle));
+
+  // Each control is detected on its own: a client holding only that control sends
+  // no further packets, so it is the host that has to keep repeating the snapshot.
+  platf::gamepad_state_t buttons {};
+  buttons.buttonFlags = platf::A | platf::START;
+  EXPECT_TRUE(input::gamepad_state_held(buttons));
+
+  platf::gamepad_state_t left_trigger {};
+  left_trigger.lt = 1;
+  EXPECT_TRUE(input::gamepad_state_held(left_trigger));
+
+  platf::gamepad_state_t right_trigger {};
+  right_trigger.rt = 255;
+  EXPECT_TRUE(input::gamepad_state_held(right_trigger));
+
+  platf::gamepad_state_t left_stick_x {};
+  left_stick_x.lsX = -32768;
+  EXPECT_TRUE(input::gamepad_state_held(left_stick_x));
+
+  platf::gamepad_state_t left_stick_y {};
+  left_stick_y.lsY = 1;
+  EXPECT_TRUE(input::gamepad_state_held(left_stick_y));
+
+  platf::gamepad_state_t right_stick_x {};
+  right_stick_x.rsX = -1;
+  EXPECT_TRUE(input::gamepad_state_held(right_stick_x));
+
+  platf::gamepad_state_t right_stick_y {};
+  right_stick_y.rsY = 32767;
+  EXPECT_TRUE(input::gamepad_state_held(right_stick_y));
+}
+
 TEST_F(InputGamepadSessionTest, RejectsMalformedBatchablePacketsAtQueueIngress) {
   ASSERT_FALSE(task_pool.running());
   const std::shared_ptr<input::input_t> empty_input;
