@@ -53,26 +53,41 @@
 #ifndef __AUDIOCLIENT_PROCESS_LOOPBACK_DEFINED
 #define __AUDIOCLIENT_PROCESS_LOOPBACK_DEFINED
 
+/**
+ * @brief Activation kind passed to ActivateAudioInterfaceAsync.
+ *
+ * Selects between the default endpoint and per-process loopback capture.
+ */
 typedef enum AUDIOCLIENT_ACTIVATION_TYPE {
-  AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,
-  AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1,
+  AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,  ///< Activate the default audio endpoint.
+  AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1,  ///< Activate process-isolated loopback capture.
 } AUDIOCLIENT_ACTIVATION_TYPE;
 
+/**
+ * @brief Process tree scope captured by loopback activation.
+ */
 typedef enum PROCESS_LOOPBACK_MODE {
-  PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0,
-  PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1,
+  PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0,  ///< Include threads of the target process.
+  PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1,  ///< Capture only the target process itself.
 } PROCESS_LOOPBACK_MODE;
 
+/**
+ * @brief Per-process loopback request carried by loopback activation.
+ */
 typedef struct AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-  DWORD TargetProcessId;
-  PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
+  DWORD TargetProcessId;  ///< Process whose rendered audio is captured.
+  PROCESS_LOOPBACK_MODE ProcessLoopbackMode;  ///< Process tree scope of the capture.
 } AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS;
 
+/**
+ * @brief Parameters supplied when activating an audio interface.
+ */
 typedef struct AUDIOCLIENT_ACTIVATION_PARAMS {
-  AUDIOCLIENT_ACTIVATION_TYPE ActivationType;
+  AUDIOCLIENT_ACTIVATION_TYPE ActivationType;  ///< Activation kind requested.
+
   union {
-    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
-  } loopback_union;
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;  ///< Loopback request for process capture.
+  } loopback_union;  ///< Parameters for the requested activation kind.
 } AUDIOCLIENT_ACTIVATION_PARAMS;
 
 /// Virtual device identifier selecting WASAPI process-isolated loopback capture.

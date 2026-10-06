@@ -745,6 +745,12 @@ namespace platf::dxgi {
    */
   window_crop_t compute_window_crop(int client_left, int client_top, int client_width, int client_height, int source_width, int source_height);
 
+  /**
+   * @brief Windows.Graphics.Capture session backing a monitor or window capture.
+   *
+   * Produces frames for the capture thread and keeps the most recent produced
+   * frame available until the consumer takes it.
+   */
   class wgc_capture_t {
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice uwp_device {nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem item {nullptr};
