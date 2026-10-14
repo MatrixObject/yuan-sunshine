@@ -94,6 +94,17 @@ namespace input {
     void set_platform_input(platf::input_t input);
 
     /**
+     * @brief Force gamepad platform allocation to fail for a unit test.
+     *
+     * Lets a test exercise the XInput-over-UDP fallback that keeps a slot
+     * alive when the host has no usable virtual-pad backend, without touching
+     * a real driver.
+     *
+     * @param fail True to make the next platform gamepad allocations fail.
+     */
+    void set_platform_alloc_fails(bool fail);
+
+    /**
      * @brief Allocate a gamepad directly in retained input state for a unit test.
      *
      * @param input Retained input state.
@@ -313,6 +324,19 @@ namespace input {
    * @return The active delivery mode.
    */
   xinput_delivery get_xinput_delivery();
+
+  /**
+   * @brief Whether XInput snapshots must reach the spoofed game process.
+   *
+   * Active while a process or window capture is selected and the runtime
+   * XInput delivery mode is not off. This is the only condition the loopback
+   * snapshot feed depends on: a missing virtual-pad backend must never silence
+   * the delivery, because the spoofed game reads its controls from the
+   * snapshot feed, not from an OS-visible device.
+   *
+   * @return True while capture is active and the delivery mode is not off.
+   */
+  bool xinput_delivery_armed();
 
   /**
    * @brief Query the current XInput-over-UDP base port.

@@ -222,6 +222,39 @@ namespace SunshineWindowController.Services
         }
 
         /// <summary>
+        /// 移除共享配置文件里的 OptionsFile 指针行。
+        ///
+        /// GameArchives 在注入前会把 "OptionsFile=&lt;绝对路径&gt;" 写进共享的
+        /// focus_options.txt，让 focusspoof 的 attach 锁定向该游戏的独立配置
+        /// （focus_options_xxx.txt）。但共享文件是控制器与 DLL 共用的，因此
+        /// 残留的指针会把本控制器管理的注入/重新启用也重定向到别的游戏的配置
+        /// 甚至它的 TargetWindow。控制器驱动的每次注入与重新启用前都应先清掉这
+        /// 一行，保证 DLL 始终读取共享 focus_options.txt 本身。读改写风格与
+        /// SetOption 一致：只删除目标键，其余行原样保留。
+        /// </summary>
+        private static void RemoveOptionsFilePointer()
+        {
+            try
+            {
+                if (!File.Exists(ConfigPath))
+                    return;
+
+                var lines = new System.Collections.Generic.List<string>(File.ReadAllLines(ConfigPath));
+                int removed = lines.RemoveAll(line =>
+                    line.TrimStart().StartsWith("OptionsFile=", StringComparison.OrdinalIgnoreCase));
+
+                if (removed > 0 && lines.Count > 0)
+                    File.WriteAllLines(ConfigPath, lines);
+                else if (removed > 0)
+                    File.WriteAllText(ConfigPath, ""); // 原文件只剩指针行：写空文件而非留下脏行。
+            }
+            catch (Exception)
+            {
+                // 静默失败：与 SetOption 一致，不因配置文件问题阻塞注入。
+            }
+        }
+
+        /// <summary>
         /// 向游戏进程注入焦点伪造 DLL。
         /// </summary>
         /// <param name="pid">目标游戏进程 ID</param>
@@ -243,6 +276,11 @@ namespace SunshineWindowController.Services
                 message = "未指定目标窗口句柄。";
                 return false;
             }
+
+            // 本控制器管理的注入必须读取共享 focus_options.txt：先清掉可能残留的
+            // OptionsFile 指针（GameArchives 写入的），否则 DLL attach 会被重定向
+            // 到别的游戏的独立配置文件。
+            RemoveOptionsFilePointer();
 
             // 把目标窗口句柄传给 DLL（DLL 优先用外部传入的句柄，不再自找）
             SetOption("TargetWindow", hwnd.ToInt64());
@@ -318,6 +356,12 @@ namespace SunshineWindowController.Services
                 message = "未知导出函数：" + exportName;
                 return false;
             }
+
+            // SpoofStart 会重跑 worker 并重读配置，且只支持重新启用场景：
+            // 同样先清掉残留的 OptionsFile 指针，避免重新启用后被重定向到
+            // 别的游戏的独立配置文件（SpoofStop 不读配置，无需处理）。
+            if (exportName == "SpoofStart")
+                RemoveOptionsFilePointer();
 
             if (!ResolveBinaries(pid, out var injector, out var dll, out message))
                 return false;

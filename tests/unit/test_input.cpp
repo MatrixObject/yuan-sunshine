@@ -77,6 +77,7 @@ namespace {
       runtime_ = context.runtime.get();
       ASSERT_NE(runtime_, nullptr);
       input::testing::set_platform_input(std::move(platform_input));
+      input::testing::set_platform_alloc_fails(false);
     }
 
     /**
@@ -287,6 +288,40 @@ TEST(InputXInputDeliveryTest, MatchesExchangeableRuntimeState) {
   input::set_xinput_delivery(original_mode, original_port);
 }
 
+TEST(InputXInputDeliveryTest, ArmsDeliveryOnlyWhenWindowCapturePairsWithAnActiveMode) {
+  const auto original_process = config::video.capture_process;
+  const auto original_window = config::video.capture_window;
+  const auto original_mode = input::get_xinput_delivery();
+  const auto original_port = input::get_xinput_udp_base_port();
+
+  config::video.capture_process = 0;
+  config::video.capture_window = 0;
+  input::set_xinput_delivery(input::xinput_delivery::global, 45690);
+  EXPECT_FALSE(input::xinput_delivery_armed());
+
+  config::video.capture_window = 0x1234;
+  input::set_xinput_delivery(input::xinput_delivery::off, 45690);
+  EXPECT_FALSE(input::xinput_delivery_armed());
+
+  config::video.capture_process = 12345;
+  config::video.capture_window = 0;
+  input::set_xinput_delivery(input::xinput_delivery::global, 45690);
+  EXPECT_TRUE(input::xinput_delivery_armed());
+
+  config::video.capture_window = 0x1234;
+  input::set_xinput_delivery(input::xinput_delivery::process, 45691);
+  EXPECT_TRUE(input::xinput_delivery_armed());
+
+  config::video.capture_process = 0;
+  config::video.capture_window = 0;
+  input::set_xinput_delivery(input::xinput_delivery::global, 45690);
+  EXPECT_FALSE(input::xinput_delivery_armed());
+
+  config::video.capture_process = original_process;
+  config::video.capture_window = original_window;
+  input::set_xinput_delivery(original_mode, original_port);
+}
+
 TEST(InputXInputDeliveryTest, EnforcesWireSize) {
   EXPECT_EQ(sizeof(input::xinput_gamepad_t), 12);
   EXPECT_EQ(sizeof(input::xinput_udp_packet), 24);
@@ -441,6 +476,87 @@ TEST_F(InputGamepadSessionTest, ReusesGamepadsAcrossPauseAndDestroysThemOnTermin
 
   auto replacement = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id);
   EXPECT_NE(replacement, resumed);
+}
+
+TEST_F(InputGamepadSessionTest, KeepsSlotAliveWithoutPlatformBackendWhenWindowCaptureDelivers) {
+  const auto original_process = config::video.capture_process;
+  const auto original_window = config::video.capture_window;
+  const auto original_mode = input::get_xinput_delivery();
+  const auto original_port = input::get_xinput_udp_base_port();
+  config::video.capture_process = 12345;
+  config::video.capture_window = 0;
+  input::set_xinput_delivery(input::xinput_delivery::global, input::xinput_udp_default_port);
+  input::testing::set_platform_alloc_fails(true);
+
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  auto stream = input::alloc(mail, "udp-fallback-session");
+  ASSERT_NE(stream, nullptr);
+
+  const auto active_devices_before = runtime().active_device_count();
+  const platf::gamepad_arrival_t metadata {LI_CTYPE_XBOX, 0, 0};
+  const auto id = input::testing::alloc_gamepad(stream, 0, metadata);
+  EXPECT_GE(id, 0);
+  EXPECT_EQ(input::testing::gamepad_id(stream, 0), id);
+  // The missing backend was never touched: no OS-visible device was created.
+  EXPECT_EQ(runtime().active_device_count(), active_devices_before);
+
+  input::testing::set_platform_alloc_fails(false);
+  config::video.capture_process = original_process;
+  config::video.capture_window = original_window;
+  input::set_xinput_delivery(original_mode, original_port);
+}
+
+TEST_F(InputGamepadSessionTest, RejectsGamepadWithoutPlatformBackendWhenDeliveryIsOff) {
+  const auto original_process = config::video.capture_process;
+  const auto original_window = config::video.capture_window;
+  const auto original_mode = input::get_xinput_delivery();
+  const auto original_port = input::get_xinput_udp_base_port();
+  config::video.capture_process = 12345;
+  config::video.capture_window = 0;
+  input::set_xinput_delivery(input::xinput_delivery::off, input::xinput_udp_default_port);
+  input::testing::set_platform_alloc_fails(true);
+
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  auto stream = input::alloc(mail, "udp-off-session");
+  ASSERT_NE(stream, nullptr);
+
+  const auto active_devices_before = runtime().active_device_count();
+  const platf::gamepad_arrival_t metadata {LI_CTYPE_XBOX, 0, 0};
+  const auto id = input::testing::alloc_gamepad(stream, 0, metadata);
+  EXPECT_LT(id, 0);
+  EXPECT_EQ(input::testing::gamepad_id(stream, 0), -1);
+  // A rejected slot must not touch the backend either.
+  EXPECT_EQ(runtime().active_device_count(), active_devices_before);
+
+  input::testing::set_platform_alloc_fails(false);
+  config::video.capture_process = original_process;
+  config::video.capture_window = original_window;
+  input::set_xinput_delivery(original_mode, original_port);
+}
+
+TEST_F(InputGamepadSessionTest, RejectsGamepadWithoutPlatformBackendWithoutWindowCapture) {
+  const auto original_process = config::video.capture_process;
+  const auto original_window = config::video.capture_window;
+  const auto original_mode = input::get_xinput_delivery();
+  const auto original_port = input::get_xinput_udp_base_port();
+  config::video.capture_process = 0;
+  config::video.capture_window = 0;
+  input::set_xinput_delivery(input::xinput_delivery::global, input::xinput_udp_default_port);
+  input::testing::set_platform_alloc_fails(true);
+
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  auto stream = input::alloc(mail, "no-capture-session");
+  ASSERT_NE(stream, nullptr);
+
+  const platf::gamepad_arrival_t metadata {LI_CTYPE_XBOX, 0, 0};
+  const auto id = input::testing::alloc_gamepad(stream, 0, metadata);
+  EXPECT_LT(id, 0);
+  EXPECT_EQ(input::testing::gamepad_id(stream, 0), -1);
+
+  input::testing::set_platform_alloc_fails(false);
+  config::video.capture_process = original_process;
+  config::video.capture_window = original_window;
+  input::set_xinput_delivery(original_mode, original_port);
 }
 
 TEST_F(InputGamepadSessionTest, RefreshesSharedVirtualInputAfterLicenseStateChanges) {

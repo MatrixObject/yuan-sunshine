@@ -403,7 +403,7 @@ namespace platf {
           break;
         }
       }
-      if (disconnect) {
+      if (disconnect && client) {
         BOOST_LOG(debug) << "Disconnecting from ViGEmBus driver"sv;
         vigem_disconnect(client.get());
         client.reset();
@@ -976,12 +976,7 @@ namespace platf {
    * delivery mode for the current stream is not off.
    */
   static bool xinput_delivery_ready() {
-    // Window capture mode is active when either a capture process or a
-    // capture window was requested; mirror the snapshot to the game process.
-    if (config::video.capture_process == 0 && config::video.capture_window == 0) {
-      return false;
-    }
-    return ::input::get_xinput_delivery() != ::input::xinput_delivery::off;
+    return ::input::xinput_delivery_armed();
   }
 
   /**

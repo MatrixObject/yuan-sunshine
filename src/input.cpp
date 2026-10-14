@@ -177,6 +177,9 @@ namespace input {
     static std::function<void(const testing::keyboard_event_t &)> sink;
     return sink;
   }
+
+  /// Forced platform gamepad-allocation failure flag (unit tests only).
+  static bool g_test_platform_alloc_fails = false;
 #endif
   static std::bitset<platf::MAX_GAMEPADS> gamepadMask {};
 
@@ -1304,9 +1307,24 @@ namespace input {
       return -1;
     }
 
-    if (platf::alloc_gamepad(platf_input, {id, static_cast<std::uint8_t>(client_index)}, arrival, input->feedback_queue)) {
-      free_id(gamepadMask, id);
-      return -1;
+    bool platform_alloc_failed;
+#ifdef SUNSHINE_TESTS
+    platform_alloc_failed = g_test_platform_alloc_fails;
+    if (!platform_alloc_failed)
+#endif
+      platform_alloc_failed = platf::alloc_gamepad(platf_input, {id, static_cast<std::uint8_t>(client_index)}, arrival, input->feedback_queue) != 0;
+
+    if (platform_alloc_failed) {
+      // A missing virtual-pad backend (for example ViGEmBus without its
+      // driver) must not starve the spoofed game: in window capture mode the
+      // client state is delivered over the XInput UDP path alone, which needs
+      // no OS-visible device. Keep the slot alive while that path is live.
+      if (!xinput_delivery_armed()) {
+        free_id(gamepadMask, id);
+        return -1;
+      }
+
+      BOOST_LOG(warning) << "Gamepad ["sv << client_index << "] without a usable virtual-pad backend; continuing over XInput UDP"sv;
     }
 
     gamepad.id = id;
@@ -2038,6 +2056,10 @@ namespace input {
     return config::video.capture_process != 0 || config::video.capture_window != 0;
   }
 
+  bool xinput_delivery_armed() {
+    return is_window_capture_mode() && get_xinput_delivery() != xinput_delivery::off;
+  }
+
   /**
    * @brief Destination for XInput-over-UDP gamepad delivery (runtime only).
    */
@@ -2513,6 +2535,10 @@ namespace input {
       terminate_gamepads();
       platf_input = std::move(input);
       gamepadMask.reset();
+    }
+
+    void set_platform_alloc_fails(bool fail) {
+      g_test_platform_alloc_fails = fail;
     }
 
     int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const platf::gamepad_arrival_t &metadata) {
