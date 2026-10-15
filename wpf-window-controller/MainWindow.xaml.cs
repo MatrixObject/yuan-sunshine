@@ -405,6 +405,34 @@ namespace SunshineWindowController
             return _settings.XInputEnabled ? "process" : "off";
         }
 
+        /// <summary>
+        /// 在注入焦点伪造之前，把采集目标与 XInput-over-UDP 投递模式一并重新下发给
+        /// Sunshine。
+        ///
+        /// xinput_delivery 是**运行时状态**，只随 /api/capture-window 请求下发，且与
+        /// 采集目标（capture_window/capture_process）是同一次请求的一部分。因此只点
+        /// 「开启窗口伪聚焦」而不再点「切换到此窗口」，Sunshine 侧就仍停留在上一次
+        /// （可能是桌面 → off）的投递模式：此时窗口采集模式下没有可用的虚拟手柄后端
+        /// （libvirtualhid 未安装 / ViGEmBus 不可用），Sunshine 会判定该客户端手柄
+        /// 「无后端可用」而整包丢弃，游戏自然收不到任何手柄输入（表现为"注入了但完全
+        /// 没变化"）。注入前重新下发一次，保证伪聚焦与手柄投递始终成对生效。
+        /// </summary>
+        /// <param name="target">要注入伪聚焦的目标窗口。</param>
+        /// <returns>Sunshine 接受切换返回 true；网络/认证失败返回 false（不阻断注入）。</returns>
+        private async Task<bool> EnsureCaptureDeliveryAsync(CaptureTarget target)
+        {
+            using var service = CreateService();
+            try
+            {
+                var status = await service.SwitchToWindowAsync(target.Hwnd, BuildXinputDeliveryValue(), _settings.XInputPort);
+                return (int)status == 200;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
         private SunshineService CreateService()
         {
             return new SunshineService
@@ -835,6 +863,11 @@ namespace SunshineWindowController
                     // 之前已注入过、现在处于「已卸载」状态：调用导出函数重新启用，
                     // 而不是再次注入（DLL 已加载，再次 LoadLibrary 不会重跑 DllMain）。
                     SetStatus("正在开启窗口伪聚焦：" + target.Title + " ...");
+                    // 重新启用同样要保证 Sunshine 侧的手柄投递模式与本目标一致。
+                    if (!await EnsureCaptureDeliveryAsync(target))
+                    {
+                        SetStatus("提示：未能确认 Sunshine 采集目标/XInput 投递已生效，请检查地址与账号密码。");
+                    }
                     var ok = await Task.Run(() => FocusSpoof.CallExport(target.Pid, "SpoofStart", out var msg)
                         ? (true, msg)
                         : (false, msg));
@@ -848,6 +881,15 @@ namespace SunshineWindowController
                 else
                 {
                     SetStatus("正在开启窗口伪聚焦：" + target.Title + " ...");
+                    // 注入前先把采集目标 + xinput_delivery=process 下发给 Sunshine：
+                    // xinput_delivery 只在 /api/capture-window 请求里下发，且是运行时
+                    // 状态，仅靠注入 DLL 不会让它变成 process。若它停留在 off（例如上次
+                    // 切到了桌面），窗口采集模式下 Sunshine 会把客户端手柄整包丢弃，
+                    // 游戏就永远看不到手柄（"注入了但完全没变化"）。
+                    if (!await EnsureCaptureDeliveryAsync(target))
+                    {
+                        SetStatus("提示：未能确认 Sunshine 采集目标/XInput 投递已生效，请检查地址与账号密码。");
+                    }
                     var focusOk = await Task.Run(() => FocusSpoof.SpoofActivation(target.Pid, target.Hwnd, out string msg)
                         ? (true, msg)
                         : (false, msg));

@@ -30,6 +30,14 @@
     as Doom 3 BFG): g++ -m32 ... -> focusspoof32.dll, gcc -m32 ... ->
     injectedll32.exe. FocusSpoof picks the pair matching the target process
     bitness, so both are copied next to the controller.
+
+    The DLLs MUST be linked with -static (e.g.
+    g++ -shared -O2 -s focusspoof.cpp -o focusspoof.dll -static -lws2_32 -lole32 -loleaut32
+    and the -m32 variant with -Wl,--kill-at). Otherwise they hard-import the
+    MinGW runtime (libstdc++-6.dll via new(std::nothrow) in the WMI shim, and
+    libwinpthread-1.dll) which is not shipped, so the game process's
+    LoadLibraryW fails and injection silently does nothing off the build box.
+    With -static the only imports are system DLLs.
   -->
   <ItemGroup>
     <None Include="..\focusspoof\focusspoof.dll" CopyToOutputDirectory="PreserveNewest" Link="focusspoof.dll" />

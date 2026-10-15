@@ -37,6 +37,15 @@
  * identity). A real tree only holds keyboard/mouse, so the RAWFAKE marker can
  * only come from the injected fake-HID layer.
  *
+ * Every 2 s it also probes Windows.Gaming.Input exactly like a UE5 title
+ * (Split Fiction reads pads through the WinRT Gamepad statics, never XInput):
+ * activate Windows.Gaming.Input.Gamepad through RoGetActivationFactory, read
+ * get_Gamepads, walk the IIterable range-for shape, then poll the pad with
+ * GetCurrentReading and put_Vibration (WGILIST / WGITER / WGIREAD / WGIVIB /
+ * WGIADD). The real statics on this machine has no pad, so the markers can
+ * only come from the injected WGI fake layer; WGIFIRE would flag the fake
+ * firing GamepadAdded, which the layer must never do.
+ *
  * Usage: testtarget.exe [suffix]
  * Build: gcc -municode -mwindows -O2 -s testtarget.c -o testtarget.exe \
  *        -lsetupapi -lhid -lole32 -loleaut32
@@ -722,6 +731,414 @@ static void ProbeDirectInput(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Windows.Gaming.Input probe (WinRT-path check for UE5 titles)       */
+/* ------------------------------------------------------------------ */
+
+/* Split Fiction and other UE5 titles read controllers through the WinRT
+   Windows.Gaming.Input.Gamepad statics instead of XInput. The injected DLL
+   serves a fake factory for that activation when XInputFakeWgi is on; this
+   probe replays a C++/WinRT title's access pattern with hand-declared C
+   vtables (MinGW ships no projection for these interfaces): activate the
+   statics through combase!RoGetActivationFactory, read get_Gamepads, QI the
+   view for IIterable and walk First / HasCurrent / Current / MoveNext like
+   a range-for, then poll the pad with GetCurrentReading and put_Vibration.
+   The real statics on this machine (no controller attached) hands back an
+   empty list, so WGILIST size=1, WGIREAD, WGIVIB and WGIADD can only come
+   from the DLL. WGIFIRE would flag the fake firing GamepadAdded, which the
+   layer deliberately never does. */
+
+/**
+ * @brief WinRT EventRegistrationToken as handed back by add_GamepadAdded.
+ */
+typedef struct WgiToken {
+  LONGLONG value; ///< Opaque token payload.
+} WgiToken;
+
+/**
+ * @brief WinRT GamepadReading as returned by IGamepad::GetCurrentReading.
+ */
+typedef struct WgiReading {
+  ULONGLONG Timestamp;      ///< QPC-derived microseconds.
+  DWORD Buttons;            ///< WGI GamepadButtonsFlags bit field.
+  double LeftTrigger;       ///< 0..1.
+  double RightTrigger;      ///< 0..1.
+  double LeftThumbstickX;   ///< -1..1.
+  double LeftThumbstickY;   ///< -1..1.
+  double RightThumbstickX;  ///< -1..1.
+  double RightThumbstickY;  ///< -1..1.
+} WgiReading;
+
+/**
+ * @brief WinRT GamepadVibration as accepted by IGamepad::put_Vibration.
+ */
+typedef struct WgiVibration {
+  double LeftMotor;   ///< 0..1.
+  double RightMotor;  ///< 0..1.
+  double LeftTrigger; ///< 0..1.
+  double RightTrigger; ///< 0..1.
+} WgiVibration;
+
+/**
+ * @brief IGamepadStatics vtable (activation result for the Gamepad runtime
+ *        class), IInspectable base slots first.
+ */
+typedef struct WgiStaticsVt {
+  HRESULT(WINAPI* Qi)(void*, REFIID, void**);           ///< IUnknown::QueryInterface.
+  ULONG(WINAPI* AddRef)(void*);                        ///< IUnknown::AddRef.
+  ULONG(WINAPI* Release)(void*);                       ///< IUnknown::Release.
+  HRESULT(WINAPI* GetIids)(void*, ULONG*, GUID**);     ///< IInspectable::GetIids.
+  HRESULT(WINAPI* GetRuntimeClassName)(void*, void**); ///< IInspectable.
+  HRESULT(WINAPI* GetTrustLevel)(void*, LONG*);        ///< IInspectable.
+  HRESULT(WINAPI* AddAdded)(void*, void*, WgiToken*);  ///< add_GamepadAdded.
+  HRESULT(WINAPI* RemoveAdded)(void*, WgiToken);       ///< remove_GamepadAdded.
+  HRESULT(WINAPI* AddRemoved)(void*, void*, WgiToken*); ///< add_GamepadRemoved.
+  HRESULT(WINAPI* RemoveRemoved)(void*, WgiToken);     ///< remove_GamepadRemoved.
+  HRESULT(WINAPI* GetPads)(void*, void**);             ///< get_Gamepads.
+} WgiStaticsVt;
+
+/**
+ * @brief IGamepadStatics object (first slot is the vtable pointer).
+ */
+typedef struct WgiStatics {
+  const WgiStaticsVt* vt; ///< Virtual table.
+} WgiStatics;
+
+/**
+ * @brief IGamepad vtable, IInspectable base slots first.
+ */
+typedef struct WgiPadVt {
+  HRESULT(WINAPI* Qi)(void*, REFIID, void**);           ///< IUnknown::QueryInterface.
+  ULONG(WINAPI* AddRef)(void*);                        ///< IUnknown::AddRef.
+  ULONG(WINAPI* Release)(void*);                       ///< IUnknown::Release.
+  HRESULT(WINAPI* GetIids)(void*, ULONG*, GUID**);     ///< IInspectable::GetIids.
+  HRESULT(WINAPI* GetRuntimeClassName)(void*, void**); ///< IInspectable.
+  HRESULT(WINAPI* GetTrustLevel)(void*, LONG*);        ///< IInspectable.
+  HRESULT(WINAPI* GetVibration)(void*, WgiVibration*);  ///< get_Vibration.
+  HRESULT(WINAPI* PutVibration)(void*, WgiVibration);   ///< put_Vibration.
+  HRESULT(WINAPI* GetReading)(void*, WgiReading*);     ///< GetCurrentReading.
+} WgiPadVt;
+
+/**
+ * @brief IGamepad object (first slot is the vtable pointer).
+ */
+typedef struct WgiPad {
+  const WgiPadVt* vt; ///< Virtual table.
+} WgiPad;
+
+/**
+ * @brief IVectorView&lt;Gamepad&gt; vtable, IInspectable base slots first.
+ */
+typedef struct WgiViewVt {
+  HRESULT(WINAPI* Qi)(void*, REFIID, void**);           ///< IUnknown::QueryInterface.
+  ULONG(WINAPI* AddRef)(void*);                        ///< IUnknown::AddRef.
+  ULONG(WINAPI* Release)(void*);                       ///< IUnknown::Release.
+  HRESULT(WINAPI* GetIids)(void*, ULONG*, GUID**);     ///< IInspectable::GetIids.
+  HRESULT(WINAPI* GetRuntimeClassName)(void*, void**); ///< IInspectable.
+  HRESULT(WINAPI* GetTrustLevel)(void*, LONG*);        ///< IInspectable.
+  HRESULT(WINAPI* GetAt)(void*, UINT32, void**);         ///< GetAt.
+  HRESULT(WINAPI* GetSize)(void*, UINT32*);             ///< get_Size.
+  HRESULT(WINAPI* IndexOf)(void*, void*, UINT32*, unsigned char*); ///< IndexOf.
+  HRESULT(WINAPI* GetMany)(void*, UINT32, UINT32, void**, UINT32*); ///< GetMany.
+} WgiViewVt;
+
+/**
+ * @brief IVectorView&lt;Gamepad&gt; object (first slot is the vtable pointer).
+ */
+typedef struct WgiView {
+  const WgiViewVt* vt; ///< Virtual table.
+} WgiView;
+
+/**
+ * @brief IIterable&lt;Gamepad&gt; vtable (what a C++/WinRT range-for QIs the
+ *        view for).
+ */
+typedef struct WgiIterableVt {
+  HRESULT(WINAPI* Qi)(void*, REFIID, void**);           ///< IUnknown::QueryInterface.
+  ULONG(WINAPI* AddRef)(void*);                        ///< IUnknown::AddRef.
+  ULONG(WINAPI* Release)(void*);                       ///< IUnknown::Release.
+  HRESULT(WINAPI* GetIids)(void*, ULONG*, GUID**);     ///< IInspectable::GetIids.
+  HRESULT(WINAPI* GetRuntimeClassName)(void*, void**); ///< IInspectable.
+  HRESULT(WINAPI* GetTrustLevel)(void*, LONG*);        ///< IInspectable.
+  HRESULT(WINAPI* First)(void*, void**);                ///< First.
+} WgiIterableVt;
+
+/**
+ * @brief IIterable&lt;Gamepad&gt; object (first slot is the vtable pointer).
+ */
+typedef struct WgiIterable {
+  const WgiIterableVt* vt; ///< Virtual table.
+} WgiIterable;
+
+/**
+ * @brief IIterator&lt;Gamepad&gt; vtable, IInspectable base slots first.
+ */
+typedef struct WgiIterVt {
+  HRESULT(WINAPI* Qi)(void*, REFIID, void**);           ///< IUnknown::QueryInterface.
+  ULONG(WINAPI* AddRef)(void*);                        ///< IUnknown::AddRef.
+  ULONG(WINAPI* Release)(void*);                       ///< IUnknown::Release.
+  HRESULT(WINAPI* GetIids)(void*, ULONG*, GUID**);     ///< IInspectable::GetIids.
+  HRESULT(WINAPI* GetRuntimeClassName)(void*, void**); ///< IInspectable.
+  HRESULT(WINAPI* GetTrustLevel)(void*, LONG*);        ///< IInspectable.
+  HRESULT(WINAPI* GetCurrent)(void*, void**);           ///< get_Current.
+  HRESULT(WINAPI* GetHasCurrent)(void*, unsigned char*); ///< get_HasCurrent.
+  HRESULT(WINAPI* MoveNext)(void*, unsigned char*);    ///< MoveNext.
+  HRESULT(WINAPI* GetManyIter)(void*, UINT32, void**, UINT32*); ///< GetMany.
+} WgiIterVt;
+
+/**
+ * @brief IIterator&lt;Gamepad&gt; object (first slot is the vtable pointer).
+ */
+typedef struct WgiIter {
+  const WgiIterVt* vt; ///< Virtual table.
+} WgiIter;
+
+/**
+ * @brief IEventHandler&lt;Gamepad&gt; vtable for the probe's subscription.
+ */
+typedef struct WgiHandlerVt {
+  HRESULT(WINAPI* Qi)(void*, REFIID, void**); ///< IUnknown::QueryInterface.
+  ULONG(WINAPI* AddRef)(void*);              ///< IUnknown::AddRef.
+  ULONG(WINAPI* Release)(void*);             ///< IUnknown::Release.
+  HRESULT(WINAPI* Invoke)(void*, void*, void*); ///< Invoke (sender, gamepad).
+} WgiHandlerVt;
+
+/**
+ * @brief IEventHandler&lt;Gamepad&gt; object (first slot is the vtable
+ *        pointer).
+ */
+typedef struct WgiHandler {
+  const WgiHandlerVt* vt; ///< Virtual table.
+} WgiHandler;
+
+/**
+ * @brief Generic leading three slots every WinRT interface shares, so any
+ *        interface pointer can be released through it.
+ */
+typedef struct WgiAnyVt {
+  HRESULT(WINAPI* Qi)(void*, REFIID, void**); ///< IUnknown::QueryInterface.
+  ULONG(WINAPI* AddRef)(void*);               ///< IUnknown::AddRef.
+  ULONG(WINAPI* Release)(void*);              ///< IUnknown::Release.
+} WgiAnyVt;
+
+/**
+ * @brief Untyped WinRT interface pointer used with WgiAnyVt.
+ */
+typedef struct WgiAny {
+  const WgiAnyVt* vt; ///< Virtual table.
+} WgiAny;
+
+/* MinGW ships no WinRT projection GUIDs; the canonical SDK IIDs, the same
+   ones focusspoof.dll serves fakes for. */
+static const GUID kTestIidGamepadStatics = {0x8BBCE529, 0xD49C, 0x39E9,
+                                             {0x95, 0x60, 0xE4, 0x7D, 0xDE, 0x96, 0xB7, 0xC8}};
+static const GUID kTestIidIterableGamepad = {0x47132BA0, 0x6B17, 0x5CD2,
+                                            {0xA8, 0xBD, 0xB5, 0xD3, 0x44, 0x3C, 0xCB, 0x13}};
+static const GUID kTestIidGamepad = {0xBC7BB43C, 0x9BB9, 0x58C2,
+                                     {0xA5, 0xAD, 0x6D, 0x17, 0x12, 0xDC, 0x9A, 0x3D}};
+
+typedef HRESULT(WINAPI* TRoGetFactory)(void*, REFIID, void**); ///< RoGetActivationFactory.
+typedef HRESULT(WINAPI* TCreateHstr)(PCWSTR, INT32, void**);   ///< WindowsCreateString.
+typedef HRESULT(WINAPI* TDeleteHstr)(void*);                  ///< WindowsDeleteString.
+static TRoGetFactory g_roGetFactory; ///< combase!RoGetActivationFactory, resolved lazily.
+static TCreateHstr g_createHstr;     ///< combase!WindowsCreateString, resolved lazily.
+static TDeleteHstr g_deleteHstr;     ///< combase!WindowsDeleteString, resolved lazily.
+
+static volatile LONG g_wgiVibSaw = 0;      ///< Latched once a vibration write succeeded.
+static volatile LONG g_wgiVibLogged = 0;   ///< Whether WGIVIB was flushed.
+static volatile LONG g_wgiAddSaw = 0;       ///< Latched once GamepadAdded was subscribed.
+static volatile LONG g_wgiAddLogged = 0;   ///< Whether WGIADD was flushed.
+static volatile LONG g_wgiFireLogged = 0;  ///< Whether the anomalous WGIFIRE was flushed.
+
+/**
+ * @brief Handler QueryInterface: the probe's subscription object exposes no
+ *        interfaces beyond IUnknown.
+ * @param self Handler object.
+ * @param riid Requested interface.
+ * @param[out] out Receives the interface pointer.
+ * @return E_NOINTERFACE always.
+ */
+static HRESULT WINAPI WgiHandlerQi(void* self, REFIID riid, void** out) {
+  (void)self;
+  (void)riid;
+  *out = NULL;
+  return E_NOINTERFACE;
+}
+
+/**
+ * @brief Handler AddRef: the singleton object is immortal.
+ * @param self Handler object.
+ * @return 1 always.
+ */
+static ULONG WINAPI WgiHandlerAddRef(void* self) {
+  (void)self;
+  return 1;
+}
+
+/**
+ * @brief Handler Release: the singleton object is immortal.
+ * @param self Handler object.
+ * @return 1 always.
+ */
+static ULONG WINAPI WgiHandlerRelease(void* self) {
+  (void)self;
+  return 1;
+}
+
+/**
+ * @brief Handler Invoke: the fake layer must NEVER fire GamepadAdded, so
+ *        reaching here is an anomaly worth a marker.
+ * @param self Handler object.
+ * @param sender Sender argument.
+ * @param pad Gamepad argument.
+ * @return S_OK always.
+ */
+static HRESULT WINAPI WgiHandlerInvoke(void* self, void* sender, void* pad) {
+  (void)self;
+  (void)sender;
+  (void)pad;
+  if (g_log && InterlockedCompareExchange(&g_wgiFireLogged, 1, 0) == 0) {
+    fprintf(g_log, "WGIFIRE t=%lu (unexpected GamepadAdded)\n", GetTickCount());
+    fflush(g_log);
+  }
+  return S_OK;
+}
+
+/** @brief IEventHandler<Gamepad> vtable for the probe's subscription. */
+static const WgiHandlerVt g_wgiHandlerVt = {WgiHandlerQi, WgiHandlerAddRef,
+                                            WgiHandlerRelease, WgiHandlerInvoke};
+
+/** @brief Singleton handler object passed to add_GamepadAdded. */
+static WgiHandler g_wgiHandlerObj = {&g_wgiHandlerVt};
+
+/**
+ * @brief Windows.Gaming.Input probe: walk the WinRT pad list like a UE5
+ *        title does.
+ *
+ * Activates Windows.Gaming.Input.Gamepad through
+ * combase!RoGetActivationFactory (the export the injected DLL detours),
+ * reads get_Gamepads, QIs the view for IIterable and walks
+ * First / HasCurrent / Current / MoveNext exactly like the C++/WinRT
+ * range-for such a title compiles to, then polls the first pad with
+ * GetCurrentReading and writes a zero vibration through put_Vibration.
+ * The real statics on this machine has no pad, so the WGILIST size=1,
+ * WGIREAD, WGIVIB and WGIADD markers can only come from the injected fake
+ * layer.
+ */
+static void ProbeWgi(void) {
+  if (!g_roGetFactory) {
+    HMODULE h = LoadLibraryA("combase.dll");
+    if (h) {
+      g_roGetFactory = (TRoGetFactory)GetProcAddress(h, "RoGetActivationFactory");
+      g_createHstr = (TCreateHstr)GetProcAddress(h, "WindowsCreateString");
+      g_deleteHstr = (TDeleteHstr)GetProcAddress(h, "WindowsDeleteString");
+    }
+  }
+  if (!g_roGetFactory || !g_createHstr)
+    return;
+  void* name = NULL;
+  /* WindowsCreateString rejects -1 on this combase build and reads the
+     explicit count from the literal, so hand it the real length. */
+  static const wchar_t kWgiClassName[] = L"Windows.Gaming.Input.Gamepad";
+  if (FAILED(g_createHstr(kWgiClassName,
+                          (INT32)(sizeof(kWgiClassName) / sizeof(wchar_t) - 1),
+                          &name)))
+    return;
+  WgiStatics* statics = NULL;
+  HRESULT hr = g_roGetFactory(name, &kTestIidGamepadStatics, (void**)&statics);
+  if (g_deleteHstr)
+    g_deleteHstr(name);
+  if (FAILED(hr) || !statics)
+    return;
+  WgiView* view = NULL;
+  hr = statics->vt->GetPads(statics, (void**)&view);
+  if (SUCCEEDED(hr) && view) {
+    /* Logged every pass: the real statics serves an empty list (size=0)
+       before the fake layer is armed, so the size=1 transition is itself
+       the proof the injected layer took over. */
+    UINT32 size = 0;
+    if (SUCCEEDED(view->vt->GetSize(view, &size)) && g_log) {
+      fprintf(g_log, "WGILIST t=%lu size=%lu\n", GetTickCount(),
+              (unsigned long)size);
+      fflush(g_log);
+    }
+    /* Range-for shape: QI the view for IIterable, First, then walk. */
+    WgiIterable* iterable = NULL;
+    WgiIter* iter = NULL;
+    unsigned count = 0;
+    if (SUCCEEDED(view->vt->Qi(view, &kTestIidIterableGamepad,
+                               (void**)&iterable)) &&
+        iterable &&
+        SUCCEEDED(iterable->vt->First(iterable, (void**)&iter)) && iter) {
+      unsigned char has = 0;
+      if (SUCCEEDED(iter->vt->GetHasCurrent(iter, &has))) {
+        while (has && count < 8) {
+          void* cur = NULL;
+          if (SUCCEEDED(iter->vt->GetCurrent(iter, &cur)) && cur) {
+            ++count;
+            ((WgiAny*)cur)->vt->Release(cur);
+          }
+          if (FAILED(iter->vt->MoveNext(iter, &has)))
+            has = 0;
+        }
+      }
+      iter->vt->Release(iter);
+    }
+    if (iterable)
+      iterable->vt->Release(iterable);
+    if (g_log) {
+      fprintf(g_log, "WGITER t=%lu count=%u\n", GetTickCount(), count);
+      fflush(g_log);
+    }
+    if (size > 0) {
+      WgiPad* pad = NULL;
+      if (SUCCEEDED(view->vt->GetAt(view, 0, (void**)&pad)) && pad) {
+        WgiReading rd;
+        memset(&rd, 0, sizeof(rd));
+        if (SUCCEEDED(pad->vt->GetReading(pad, &rd)) && g_log) {
+          fprintf(g_log,
+                  "WGIREAD t=%lu btn=%lu lt=%.3f rt=%.3f lx=%.3f ly=%.3f "
+                  "rx=%.3f ry=%.3f\n",
+                  GetTickCount(), (unsigned long)rd.Buttons, rd.LeftTrigger,
+                  rd.RightTrigger, rd.LeftThumbstickX, rd.LeftThumbstickY,
+                  rd.RightThumbstickX, rd.RightThumbstickY);
+          fflush(g_log);
+        }
+        WgiVibration vib;
+        memset(&vib, 0, sizeof(vib));
+        if (SUCCEEDED(pad->vt->PutVibration(pad, vib)) &&
+            InterlockedCompareExchange(&g_wgiVibSaw, 1, 0) == 0 && !g_wgiVibLogged &&
+            g_log) {
+          fprintf(g_log, "WGIVIB t=%lu\n", GetTickCount());
+          fflush(g_log);
+          g_wgiVibLogged = 1;
+        }
+        pad->vt->Release(pad);
+      }
+      /* Subscribe exactly once for the whole run, and only once the list
+         is non-empty (the fake serving): the layer must accept the handler
+         and never invoke it (WGIFIRE would be the anomaly marker). A
+         failed attempt unlatches so a later tick retries. */
+      if (InterlockedCompareExchange(&g_wgiAddSaw, 1, 0) == 0) {
+        WgiToken tok;
+        tok.value = 0;
+        if (SUCCEEDED(statics->vt->AddAdded(statics, &g_wgiHandlerObj, &tok))) {
+          if (g_log && !g_wgiAddLogged) {
+            fprintf(g_log, "WGIADD t=%lu token=%ld\n", GetTickCount(),
+                    (long)tok.value);
+            fflush(g_log);
+            g_wgiAddLogged = 1;
+          }
+        } else {
+          InterlockedExchange(&g_wgiAddSaw, 0);
+        }
+      }
+    }
+    view->vt->Release(view);
+  }
+  statics->vt->Release(statics);
+}
+
+/* ------------------------------------------------------------------ */
 /* WMI + SetupDi/HidD probes (XInput-path gate checks)                */
 /* ------------------------------------------------------------------ */
 
@@ -820,8 +1237,11 @@ static void ProbeHidSetupDi(void) {
     if (!SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_HID, i,
                                      &data))
       break;
+    /* Size probe: the call must FAIL with ERROR_INSUFFICIENT_BUFFER and
+       report the needed byte count - that is its documented contract, so a
+       plain !ret check would wrongly skip every interface. */
     DWORD need = 0;
-    if (!SetupDiGetDeviceInterfaceDetailW(set, &data, NULL, 0, &need, NULL) ||
+    if (SetupDiGetDeviceInterfaceDetailW(set, &data, NULL, 0, &need, NULL) ||
         GetLastError() != ERROR_INSUFFICIENT_BUFFER || need == 0)
       continue;
     PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail =
@@ -1075,6 +1495,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR cmd, int nCmdShow) {
         ProbeWmiPnp();
         ProbeHidSetupDi();
         ProbeDirectInput();
+        ProbeWgi();
       }
     }
     Sleep(10);

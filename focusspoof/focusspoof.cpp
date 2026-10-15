@@ -5,15 +5,23 @@
  *        keeps rendering and consuming XInput gamepad input even when
  *        another window has the keyboard focus.
  *
- * Build:
- *   g++ -shared -O2 -s focusspoof.cpp -o focusspoof.dll -lws2_32
- * (or the equivalent MinGW-w64/MSYS2 UCRT64 toolchain)
- *   32-bit (WOW64 games such as Doom 3 BFG; MINGW32 toolchain):
+ * Build (MinGW-w64/MSYS2; UCRT64 for the 64-bit DLL, MINGW32 for the
+ * 32-bit one):
+ *   g++ -shared -O2 -s focusspoof.cpp -o focusspoof.dll \
+ *       -static -lws2_32 -lole32 -loleaut32
+ *   32-bit (WOW64 games such as Doom 3 BFG):
  *     g++ -m32 -shared -O2 -s focusspoof.cpp -o focusspoof32.dll \
- *         -static-libgcc -static-libstdc++ -Wl,--kill-at -lws2_32
- *   -static-libgcc/-static-libstdc++ keep the DLL free of libgcc_s_dw2-1.dll
- *   (the game process would not find it), --kill-at drops the i686
- *   '@0' stdcall decoration so GetProcAddress("SpoofStart") resolves.
+ *         -static -Wl,--kill-at -lws2_32 -lole32 -loleaut32
+ *   -static is REQUIRED, not cosmetic: without it the DLL hard-imports
+ *   MinGW runtime DLLs (libstdc++-6.dll via new(std::nothrow) in the WMI
+ *   shim, and - once libstdc++ is static - libwinpthread-1.dll). Neither
+ *   ships with the game or the controller, so the game process's
+ *   LoadLibraryW fails (or binds a foreign copy found in the game folder):
+ *   injection silently does nothing for every user whose machine is not
+ *   the build machine. -static folds libgcc, libstdc++ and libwinpthread
+ *   into the DLL so it imports only system DLLs (KERNEL32/USER32/WS2_32/
+ *   ole32/OLEAUT32 plus the UCRT api-sets). --kill-at drops the i686 '@0'
+ *   stdcall decoration so GetProcAddress("SpoofStart") resolves.
  *
  * Settings all come from the controller's config file, never the registry:
  *   focus_options.txt next to this DLL (the controller ships it in the
@@ -116,6 +124,25 @@
  *                                     probe count is reached.
  *   XInputFakeRetries     (default 8) - maximum identity rotations in the
  *                                     retry loop (1..16).
+ *   XInputFakeWgi         (default 0) - present the fake pad through
+ *                                     Windows.Gaming.Input as well: UE5
+ *                                     titles (Split Fiction among them)
+ *                                     read the controller through the
+ *                                     WinRT Gamepad statics instead of
+ *                                     XInput, so the XInput-side hooks
+ *                                     never fire for them. The layer
+ *                                     detours combase!RoGetActivationFactory
+ *                                     for Windows.Gaming.Input.Gamepad and
+ *                                     serves a fake statics object whose
+ *                                     get_Gamepads passes the real system
+ *                                     list through whenever the OS has a
+ *                                     controller, and otherwise presents
+ *                                     one connected fake pad fed from the
+ *                                     same UDP snapshots as the XInput
+ *                                     rewrite. Not armed-gated, exactly
+ *                                     like the XInput serve family: a
+ *                                     game enumerates the pad once at
+ *                                     startup and never looks again.
  *   DisableFocusSpoof     (default 0) - load the DLL but do nothing.
  *
  * How it works, all in-process, on a delayed worker thread (loader-lock
@@ -278,6 +305,22 @@ static volatile LONG64 g_xinputKeystrokeCalls = 0; ///< GetKeystroke calls.
 static volatile LONG64 g_xinputEnableCalls = 0;   ///< XInputEnable calls.
 static volatile LONG64 g_xinputDsoundCalls = 0;   ///< GetDSoundAudioDeviceGuids calls.
 static volatile LONG64 g_xinputAudioIdsCalls = 0; ///< GetAudioDeviceIds calls.
+/* Focus-hook diagnostics. The three focus APIs are detoured so the game keeps
+   believing its own window is foreground/active/focused. The spoof can only
+   work if the ENGINE actually asks - a title that reads focus from raw
+   WM_ACTIVATE/WM_SETFOCUS messages, from DXGI, or that simply never checks
+   gets the same answer with or without the detours. These six counters prove
+   which case a live title is in: "calls" counts every entry into the hooked
+   API, "spoofed" counts the ones answered with g_target. calls==0 means the
+   engine never consults the focus APIs at all (so any focus-related symptom
+   has a different cause), while calls>0 && spoofed==0 means the hook is
+   installed but g_state/g_target were not usable at call time. */
+static volatile LONG64 g_fgwCalls = 0;    ///< GetForegroundWindow calls after injection.
+static volatile LONG64 g_fgwSpoofed = 0;  ///< GetForegroundWindow calls answered with the target.
+static volatile LONG64 g_awCalls = 0;     ///< GetActiveWindow calls after injection.
+static volatile LONG64 g_awSpoofed = 0;   ///< GetActiveWindow calls answered with the target.
+static volatile LONG64 g_focusCalls = 0;  ///< GetFocus calls after injection.
+static volatile LONG64 g_focusSpoofed = 0; ///< GetFocus calls answered with the target.
 static HANDLE g_worker = 0;      ///< The setup worker thread.
 static HMODULE g_host = 0;       ///< This DLL's module handle.
 /* Keyboard/mouse input is disabled for the GAME at the API layer only -
@@ -430,7 +473,7 @@ static void ResetWorkerLog(void) {
  * @param fmt printf-style format string.
  */
 static void Dlog(const char* fmt, ...) {
-  char buf[1024];
+  char buf[2048];
   va_list va;
   va_start(va, fmt);
   vsnprintf(buf, sizeof(buf), fmt, va);
@@ -543,8 +586,11 @@ static FnGetWindow g_realGetFocus;
  * @return HWND of the target window while active, otherwise the real one.
  */
 static HWND WINAPI MyGetForegroundWindow(void) {
-  if (g_state == 1 && g_target && IsWindow(g_target))
+  InterlockedIncrement64(&g_fgwCalls);
+  if (g_state == 1 && g_target && IsWindow(g_target)) {
+    InterlockedIncrement64(&g_fgwSpoofed);
     return g_target;
+  }
   return g_realGetForegroundWindow();
 }
 
@@ -553,8 +599,11 @@ static HWND WINAPI MyGetForegroundWindow(void) {
  * @return HWND of the target window while active, otherwise the real one.
  */
 static HWND WINAPI MyGetActiveWindow(void) {
-  if (g_state == 1 && g_target && IsWindow(g_target))
+  InterlockedIncrement64(&g_awCalls);
+  if (g_state == 1 && g_target && IsWindow(g_target)) {
+    InterlockedIncrement64(&g_awSpoofed);
     return g_target;
+  }
   return g_realGetActiveWindow();
 }
 
@@ -563,8 +612,11 @@ static HWND WINAPI MyGetActiveWindow(void) {
  * @return HWND of the target window while active, otherwise the real one.
  */
 static HWND WINAPI MyGetFocus(void) {
-  if (g_state == 1 && g_target && IsWindow(g_target))
+  InterlockedIncrement64(&g_focusCalls);
+  if (g_state == 1 && g_target && IsWindow(g_target)) {
+    InterlockedIncrement64(&g_focusSpoofed);
     return g_target;
+  }
   return g_realGetFocus();
 }
 
@@ -709,7 +761,8 @@ struct DetourInsn {
   int opoff;    /**< Byte offset of the opcode within the instruction. */
   bool isJmp;   /**< True when the instruction is an unconditional jmp. */
   bool seg;     ///< True when a segment-override prefix was seen.
-  bool jcc;     ///< True for a near conditional jump (0F 8x rel32).
+  bool jcc;     ///< True for a conditional jump (0F 8x rel32 or 7x rel8).
+  bool jccRel8; ///< True when jcc carries a rel8 displacement instead of rel32.
   int cc;       ///< Condition code (0..15) when jcc is true.
 };
 
@@ -730,6 +783,7 @@ static bool DecodeInsn(const BYTE* p, DetourInsn* out) {
   out->seg = false;
   out->isJmp = false;
   out->jcc = false;
+  out->jccRel8 = false;
   out->cc = 0;
   out->rel = 0;
 
@@ -770,8 +824,20 @@ static bool DecodeInsn(const BYTE* p, DetourInsn* out) {
     return true;
   }
 
-  /* 0x70-0x7F rel8 jcc and 0xE3 jcxz: unusual in a prologue; reject. */
-  if ((op >= 0x70 && op <= 0x7F) || op == 0xE3)
+  /* 0x70-0x7F rel8: short conditional jump. Relocated exactly like the near
+     form, only the displacement width differs. The compiler emits this in
+     compact validity checks, so a hid.dll (or user32) export can open with it
+     on one Windows build and with the 0F 8x form on another; both must decode
+     or the export silently stays unhooked. */
+  if (op >= 0x70 && op <= 0x7F) {
+    out->len = prlen + 2;
+    out->jcc = true;
+    out->jccRel8 = true;
+    out->cc = op & 0x0F;
+    return true;
+  }
+  /* 0xE3 jcxz/jrcxz: never emitted by MSVC; reject. */
+  if (op == 0xE3)
     return false;
 
   /* Single-byte leaves. */
@@ -902,10 +968,10 @@ static bool RelocateInsn(const BYTE* src, const DetourInsn* insn,
                          RelocatedInsn* out) {
   int n = 0;
 
-  /* Near conditional jump (0F 8x rel32): the target is an arbitrary address,
-     so the branch must keep working from the trampoline's arbitrary address.
-     Invert the condition into a SHORT (2-byte `7x cb`) jump that skips a
-     register- and flag-free absolute jump to the target. There is no
+  /* Conditional jump (0F 8x rel32 or 7x rel8): the target is an arbitrary
+     address, so the branch must keep working from the trampoline's arbitrary
+     address. Invert the condition into a SHORT (2-byte `7x cb`) jump that skips
+     a register- and flag-free absolute jump to the target. There is no
      `0F 8x rel8` encoding: emitting `0F 8x <one byte>` makes the CPU decode
      that byte plus the following stub bytes as a rel32 near branch and jump
      to a garbage address (observed as the first real hid!HidP_GetCaps call in
@@ -913,7 +979,8 @@ static bool RelocateInsn(const BYTE* src, const DetourInsn* insn,
      inverted short test is not taken and the absolute jump runs; not taken ->
      the short branch skips the absolute jump. */
   if (insn->jcc) {
-    const int32_t rel = *(int32_t*)(src + insn->len - 4);
+    const int32_t rel = insn->jccRel8 ? (int32_t)(int8_t)src[insn->len - 1]
+                                      : *(int32_t*)(src + insn->len - 4);
     const uintptr_t target = (uintptr_t)(src + insn->len) + rel;
     const int at = n;
     out->bytes[n++] = (BYTE)(0x70 | (insn->cc ^ 1)); /* inverted, short form */
@@ -1658,15 +1725,11 @@ static void InputBlockHookInstall(void) {
   bool wmInput = WmInputBlockEnabled();
   bool rawApis = RawApisBlockEnabled();
   bool any = polls || wmInput || rawApis;
-  Trace("InputBlockHookInstall: BlockPollingApis=%d BlockWmInput=%d "
-        "BlockRawInputApis=%d",
-        polls ? 1 : 0, wmInput ? 1 : 0, rawApis ? 1 : 0);
   Dlog("InputBlockHookInstall: BlockPollingApis=%d BlockWmInput=%d "
        "BlockRawInputApis=%d",
        polls ? 1 : 0, wmInput ? 1 : 0, rawApis ? 1 : 0);
 
   if (!any) {
-    Trace("keyboard/mouse blocking disabled by config");
     Dlog("keyboard/mouse blocking disabled by config");
     return;
   }
@@ -1674,7 +1737,6 @@ static void InputBlockHookInstall(void) {
   InterlockedExchange(&g_blockWmInput, wmInput ? 1 : 0);
 
   {
-    Trace("Installing detours for keyboard/mouse blocking");
     Dlog("Installing detours for keyboard/mouse blocking");
 
     if (polls) {
@@ -1857,7 +1919,6 @@ static void CursorBlockHookInstall(void) {
   bool lock = CursorLockEnabled();
   InterlockedExchange(&g_enableCursorHide, hide ? 1 : 0);
   InterlockedExchange(&g_enableCursorLock, lock ? 1 : 0);
-  Trace("CursorBlockHookInstall: hide=%d lock=%d", hide ? 1 : 0, lock ? 1 : 0);
 
   if (hide) {
     InterlockedExchange(&g_enableCursorHide, 1);
@@ -2072,15 +2133,7 @@ struct XInputRuntime {
   Detour dAudioIds;     ///< XInputGetAudioDeviceIds detour record.
   char path[MAX_PATH];  ///< Full module path, for the diagnostics.
   volatile LONG64 callsGetState;  ///< GetState/GetStateEx calls through this runtime.
-  volatile LONG sawGetState; ///< First GetState/GetStateEx call marker through this runtime.
-  volatile LONG sawCaps;     ///< First GetCapabilities call marker through this runtime.
-  volatile LONG sawCapsEx;   ///< First GetCapabilitiesEx call marker through this runtime.
-  volatile LONG sawSet;      ///< First SetState call marker through this runtime.
-  volatile LONG sawBattery;  ///< First GetBatteryInformation call marker through this runtime.
-  volatile LONG sawKeystroke; ///< First GetKeystroke call marker through this runtime.
   volatile LONG sawEnable;    ///< First XInputEnable call marker through this runtime.
-  volatile LONG sawDsound;    ///< First GetDSoundAudioDeviceGuids call marker through this runtime.
-  volatile LONG sawAudioIds;  ///< First GetAudioDeviceIds call marker through this runtime.
 };
 static XInputRuntime g_xinputRuntimes[XINPUT_RUNTIME_MAX];
 static int g_xinputRuntimeCount = 0;
@@ -2224,6 +2277,23 @@ static bool ResolveFromHandle(HMODULE h, const char* who) {
       (FnXInputSetState)GetProcAddress(h, "XInputSetState");
   if (!gs || !ss)
     return false;
+  /* Dedup by MODULE HANDLE, never by name. Windows resolves some of the
+     standard names to an already-loaded mapping (the shipped xinput1_1/1_2/1_3
+     stubs and the system forwarders can share one module), so a manual
+     GetModuleHandleA + LoadLibraryA pass records the SAME mapping several
+     times. The by-name check in ResolveXInput's second pass only guards that
+     one loop; the already-loaded pass is unguarded, so a table that was 5/8
+     full ballooned to 8/8 with r5..r7 duplicating r0..r2 and then refused the
+     genuinely NEW xinput1_4.dll / xinput9_1_0.dll ("runtime table full") -
+     i.e. the cap silently dropped runtimes instead of merely being idle
+     headroom. Deduping here also makes every repeated resolution cheap. */
+  for (int i = 0; i < g_xinputRuntimeCount; ++i) {
+    if (g_xinputRuntimes[i].module == h) {
+      Dlog("xinput: %s already hooked as %s (same module %p), skipping duplicate",
+           who, g_xinputRuntimes[i].name ? g_xinputRuntimes[i].name : "?", (void*)h);
+      return true;
+    }
+  }
   if (g_xinputRuntimeCount >= XINPUT_RUNTIME_MAX) {
     Dlog("xinput: runtime table full, skipping %s", who);
     return true;
@@ -2250,13 +2320,6 @@ static bool ResolveFromHandle(HMODULE h, const char* who) {
       h, "XInputGetDSoundAudioDeviceGuids", 103);
   r.exportGetAudioIds = (FnXInputGetAudioDeviceIds)ResolveExport(
       h, "XInputGetAudioDeviceIds", 107);
-  Dlog("xinput: resolved %s (%p) path=%s getstateEx=%p caps=%p capsex=%p "
-       "battery=%p keystroke=%p enable=%p dsound=%p audioids=%p",
-       who, (void*)h, r.path, (void*)r.exportGetStateEx,
-       (void*)r.exportGetCaps, (void*)r.exportGetCapsEx,
-       (void*)r.exportGetBattery, (void*)r.exportGetKeystroke,
-       (void*)r.exportGetEnable, (void*)r.exportGetDsound,
-       (void*)r.exportGetAudioIds);
   g_xinputRuntimeCount++;
   return true;
 }
@@ -2283,8 +2346,8 @@ static void ResolveXInput(void) {
   };
   for (const char* name : names) {
     HMODULE h = GetModuleHandleA(name);
-    if (h && ResolveFromHandle(h, name))
-      Dlog("xinput: hooking already-loaded %s", name);
+    if (h)
+      ResolveFromHandle(h, name);
   }
   for (const char* name : names) {
     bool seen = false;
@@ -2299,10 +2362,15 @@ static void ResolveXInput(void) {
     HMODULE h = LoadLibraryA(name);
     if (!h)
       continue;
-    if (ResolveFromHandle(h, name))
-      Dlog("xinput: loaded %s and hooked", name);
-    else
+    int before = g_xinputRuntimeCount;
+    if (ResolveFromHandle(h, name)) {
+      if (g_xinputRuntimeCount > before)
+        Dlog("xinput: loaded %s and hooked", name);
+      else
+        Dlog("xinput: loaded %s but it maps to an already-hooked module", name);
+    } else {
       FreeLibrary(h);
+    }
   }
   if (g_xinputRuntimeCount == 0)
     Dlog("xinput: no XInput runtime found");
@@ -2372,21 +2440,12 @@ static DWORD WINAPI XInputUdpThread(LPVOID param) {
                      &fromLen);
     if (n == (int)sizeof(pkt) && pkt.magic == XINPUT_UDP_MAGIC &&
         pkt.index < XINPUT_UDP_SLOTS) {
-      WORD prevBtn = 0;
       if (g_xinputLockInit == 1) {
         EnterCriticalSection(&g_xinputLock);
-        prevBtn = g_xinputSlots[pkt.index].gamepad.wButtons;
         g_xinputSlots[pkt.index].packetNumber = pkt.packetNumber;
         g_xinputSlots[pkt.index].gamepad = pkt.gamepad;
         g_xinputSlots[pkt.index].timestamp = (LONG64)GetTickCount64();
         LeaveCriticalSection(&g_xinputLock);
-        if (pkt.gamepad.wButtons != prevBtn)
-          Dlog("xinput: pad slot=%u btn %04x -> %04x (lx=%d ly=%d rx=%d ry=%d lt=%u rt=%u)",
-               pkt.index, (unsigned)prevBtn, (unsigned)pkt.gamepad.wButtons,
-               pkt.gamepad.sThumbLX, pkt.gamepad.sThumbLY,
-               pkt.gamepad.sThumbRX, pkt.gamepad.sThumbRY,
-               (unsigned)pkt.gamepad.bLeftTrigger,
-               (unsigned)pkt.gamepad.bRightTrigger);
       }
       InterlockedIncrement64(&g_udpDatagrams);
       if (InterlockedExchange(&g_firstPkt, 1) == 0)
@@ -2420,8 +2479,6 @@ static DWORD WINAPI XInputUdpThread(LPVOID param) {
  */
 static DWORD MyGetStateImpl(XInputRuntime& rt, DWORD dwUserIndex,
                             XINPUT_STATE* pState) {
-  if (InterlockedCompareExchange(&rt.sawGetState, 1, 0) == 0)
-    Dlog("xinput: [%s] GetState called (first)", rt.name);
   if (g_xinputEnabled == 1 && g_xinputLockInit == 1 && pState &&
       dwUserIndex < XINPUT_UDP_SLOTS) {
     EnterCriticalSection(&g_xinputLock);
@@ -2472,8 +2529,6 @@ static DWORD MyGetStateImpl(XInputRuntime& rt, DWORD dwUserIndex,
  */
 static DWORD MyGetStateExImpl(XInputRuntime& rt, DWORD dwUserIndex,
                               XinputStateEx* pState) {
-  if (InterlockedCompareExchange(&rt.sawGetState, 1, 0) == 0)
-    Dlog("xinput: [%s] GetStateEx called (first)", rt.name);
   if (g_xinputEnabled == 1 && g_xinputLockInit == 1 && pState &&
       dwUserIndex < XINPUT_UDP_SLOTS) {
     EnterCriticalSection(&g_xinputLock);
@@ -2540,8 +2595,6 @@ static DWORD MyGetStateExImpl(XInputRuntime& rt, DWORD dwUserIndex,
  */
 static DWORD MySetStateImpl(XInputRuntime& rt, DWORD dwUserIndex,
                             XINPUT_VIBRATION* pVibration) {
-  if (InterlockedCompareExchange(&rt.sawSet, 1, 0) == 0)
-    Dlog("xinput: [%s] SetState called (first)", rt.name);
   InterlockedIncrement64(&g_xinputSetCalls);
   if (g_xinputFakeOn == 1)
     return (dwUserIndex == 0) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
@@ -2568,8 +2621,6 @@ static DWORD MySetStateImpl(XInputRuntime& rt, DWORD dwUserIndex,
  */
 static DWORD MyGetCapsImpl(XInputRuntime& rt, DWORD dwUserIndex, DWORD dwFlags,
                            XINPUT_CAPABILITIES* pCapabilities) {
-  if (InterlockedCompareExchange(&rt.sawCaps, 1, 0) == 0)
-    Dlog("xinput: [%s] GetCapabilities called (first)", rt.name);
   InterlockedIncrement64(&g_xinputCapsCalls);
   if (rt.realGetCaps) {
     DWORD r = rt.realGetCaps(dwUserIndex, dwFlags, pCapabilities);
@@ -2603,8 +2654,6 @@ static DWORD MyGetCapsImpl(XInputRuntime& rt, DWORD dwUserIndex, DWORD dwFlags,
 static DWORD MyGetCapsExImpl(XInputRuntime& rt, DWORD a1, DWORD dwUserIndex,
                              DWORD dwFlags,
                              XinputCapabilitiesEx* pCapabilities) {
-  if (InterlockedCompareExchange(&rt.sawCapsEx, 1, 0) == 0)
-    Dlog("xinput: [%s] GetCapabilitiesEx called (first)", rt.name);
   InterlockedIncrement64(&g_xinputCapsExCalls);
   if (pCapabilities == nullptr)
     return ERROR_INVALID_PARAMETER;
@@ -2642,8 +2691,6 @@ static DWORD MyGetCapsExImpl(XInputRuntime& rt, DWORD a1, DWORD dwUserIndex,
  */
 static DWORD MyBatteryImpl(XInputRuntime& rt, DWORD dwUserIndex, BYTE devType,
                            XINPUT_BATTERY_INFORMATION* pBatteryInformation) {
-  if (InterlockedCompareExchange(&rt.sawBattery, 1, 0) == 0)
-    Dlog("xinput: [%s] GetBatteryInformation called (first)", rt.name);
   InterlockedIncrement64(&g_xinputBatteryCalls);
   if (rt.realGetBattery) {
     DWORD r = rt.realGetBattery(dwUserIndex, devType, pBatteryInformation);
@@ -2672,8 +2719,6 @@ static DWORD MyBatteryImpl(XInputRuntime& rt, DWORD dwUserIndex, BYTE devType,
  */
 static DWORD MyKeystrokeImpl(XInputRuntime& rt, DWORD dwUserIndex,
                              DWORD dwReserved, XINPUT_KEYSTROKE* pKeystroke) {
-  if (InterlockedCompareExchange(&rt.sawKeystroke, 1, 0) == 0)
-    Dlog("xinput: [%s] GetKeystroke called (first)", rt.name);
   InterlockedIncrement64(&g_xinputKeystrokeCalls);
   if (rt.realGetKeystroke) {
     DWORD r = rt.realGetKeystroke(dwUserIndex, dwReserved, pKeystroke);
@@ -2722,8 +2767,6 @@ static void MyEnableImpl(XInputRuntime& rt, BOOL enable) {
  */
 static DWORD MyDsoundImpl(XInputRuntime& rt, DWORD dwUserIndex, GUID* pRender,
                           GUID* pCapture) {
-  if (InterlockedCompareExchange(&rt.sawDsound, 1, 0) == 0)
-    Dlog("xinput: [%s] GetDSoundAudioDeviceGuids called (first)", rt.name);
   InterlockedIncrement64(&g_xinputDsoundCalls);
   if (rt.realGetDsound) {
     DWORD r = rt.realGetDsound(dwUserIndex, pRender, pCapture);
@@ -2760,8 +2803,6 @@ static DWORD MyDsoundImpl(XInputRuntime& rt, DWORD dwUserIndex, GUID* pRender,
 static DWORD MyAudioIdsImpl(XInputRuntime& rt, DWORD dwUserIndex,
                             WCHAR* pRender, UINT* pRenderCount, WCHAR* pCapture,
                             UINT* pCaptureCount) {
-  if (InterlockedCompareExchange(&rt.sawAudioIds, 1, 0) == 0)
-    Dlog("xinput: [%s] GetAudioDeviceIds called (first)", rt.name);
   InterlockedIncrement64(&g_xinputAudioIdsCalls);
   if (rt.realGetAudioIds) {
     DWORD r =
@@ -2859,85 +2900,52 @@ DEFINE_XINPUT_WRAPPERS(7)
     XInputRuntime& rt = g_xinputRuntimes[IDX];                                \
     bool ok = DetourInstall((void*)rt.exportGetState, (void*)XGetState##IDX,  \
                             (void**)&rt.realGetState, &rt.dGetState);         \
-    Dlog(ok ? "xinput: [%d] %s GetState hooked"                               \
-            : "xinput: [%d] %s GetState skipped", IDX, rt.name);              \
     if (rt.exportGetStateEx) {                                                \
       ok = DetourInstall((void*)rt.exportGetStateEx,                          \
                          (void*)XGetStateEx##IDX,                             \
                          (void**)&rt.realGetStateEx, &rt.dGetStateEx);        \
-      Dlog(ok ? "xinput: [%d] %s GetStateEx hooked"                           \
-              : "xinput: [%d] %s GetStateEx skipped", IDX, rt.name);          \
     } else {                                                                  \
-      Dlog("xinput: [%d] %s has no GetStateEx export", IDX, rt.name);         \
     }                                                                         \
     ok = DetourInstall((void*)rt.exportSetState, (void*)XSetState##IDX,       \
                        (void**)&rt.realSetState, &rt.dSetState);              \
-    Dlog(ok ? "xinput: [%d] %s SetState hooked"                               \
-            : "xinput: [%d] %s SetState skipped", IDX, rt.name);              \
     if (rt.exportGetEnable) {                                                 \
       ok = DetourInstall((void*)rt.exportGetEnable, (void*)XEnable##IDX,      \
                          (void**)&rt.realGetEnable, &rt.dEnable);             \
-      Dlog(ok ? "xinput: [%d] %s Enable hooked"                               \
-              : "xinput: [%d] %s Enable skipped", IDX, rt.name);              \
     } else {                                                                  \
-      Dlog("xinput: [%d] %s has no XInputEnable export", IDX, rt.name);       \
     }                                                                         \
     if (rt.exportGetDsound) {                                                 \
       ok = DetourInstall((void*)rt.exportGetDsound, (void*)XDsound##IDX,      \
                          (void**)&rt.realGetDsound, &rt.dDsound);             \
-      Dlog(ok ? "xinput: [%d] %s GetDSoundAudioDeviceGuids hooked"            \
-              : "xinput: [%d] %s GetDSoundAudioDeviceGuids skipped", IDX,     \
-           rt.name);                                                          \
     } else {                                                                  \
-      Dlog("xinput: [%d] %s has no DSoundGuids export", IDX, rt.name);        \
     }                                                                         \
     if (rt.exportGetAudioIds) {                                               \
       ok = DetourInstall((void*)rt.exportGetAudioIds, (void*)XAudioIds##IDX,  \
                          (void**)&rt.realGetAudioIds, &rt.dAudioIds);         \
-      Dlog(ok ? "xinput: [%d] %s GetAudioDeviceIds hooked"                    \
-              : "xinput: [%d] %s GetAudioDeviceIds skipped", IDX, rt.name);   \
     } else {                                                                  \
-      Dlog("xinput: [%d] %s has no GetAudioDeviceIds export", IDX,            \
-           rt.name);                                                          \
     }                                                                         \
     if (fake) {                                                               \
       if (rt.exportGetCaps) {                                                 \
         ok = DetourInstall((void*)rt.exportGetCaps, (void*)XGetCaps##IDX,     \
                            (void**)&rt.realGetCaps, &rt.dGetCaps);            \
-        Dlog(ok ? "xinput: [%d] %s GetCapabilities hooked"                    \
-                : "xinput: [%d] %s GetCapabilities skipped", IDX, rt.name);   \
       } else {                                                                \
-        Dlog("xinput: [%d] %s has no GetCapabilities export", IDX, rt.name);  \
       }                                                                       \
       if (rt.exportGetCapsEx) {                                               \
         ok = DetourInstall((void*)rt.exportGetCapsEx,                         \
                            (void*)XGetCapsEx##IDX,                            \
                            (void**)&rt.realGetCapsEx, &rt.dGetCapsEx);        \
-        Dlog(ok ? "xinput: [%d] %s GetCapabilitiesEx hooked"                  \
-                : "xinput: [%d] %s GetCapabilitiesEx skipped", IDX, rt.name); \
       } else {                                                                \
-        Dlog("xinput: [%d] %s has no GetCapabilitiesEx export", IDX,          \
-             rt.name);                                                        \
       }                                                                       \
       if (rt.exportGetBattery) {                                              \
         ok = DetourInstall((void*)rt.exportGetBattery,                        \
                            (void*)XGetBattery##IDX,                           \
                            (void**)&rt.realGetBattery, &rt.dBattery);         \
-        Dlog(ok ? "xinput: [%d] %s GetBatteryInformation hooked"              \
-                : "xinput: [%d] %s GetBatteryInformation skipped", IDX,       \
-             rt.name);                                                        \
       } else {                                                                \
-        Dlog("xinput: [%d] %s has no GetBatteryInformation export", IDX,      \
-             rt.name);                                                        \
       }                                                                       \
       if (rt.exportGetKeystroke) {                                            \
         ok = DetourInstall((void*)rt.exportGetKeystroke,                      \
                            (void*)XGetKeystroke##IDX,                         \
                            (void**)&rt.realGetKeystroke, &rt.dKeystroke);     \
-        Dlog(ok ? "xinput: [%d] %s GetKeystroke hooked"                       \
-                : "xinput: [%d] %s GetKeystroke skipped", IDX, rt.name);      \
       } else {                                                                \
-        Dlog("xinput: [%d] %s has no GetKeystroke export", IDX, rt.name);     \
       }                                                                       \
     }                                                                         \
   }
@@ -3556,11 +3564,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiGetCapabilities(void*, DIDEVCAPS* caps) {
   caps->dwAxes = kDiFakeAxisCount;
   caps->dwButtons = kDiFakeButtonCount;
   caps->dwPOVs = 1;
-  if (InterlockedExchangeAdd64(&g_diCapsCalls, 1) == 0)
-    Dlog("di8: fake device GetCapabilities (first) devtype=%04x axes=%u "
-         "buttons=%u povs=%u",
-         (unsigned)kDiFakeDevType, (unsigned)kDiFakeAxisCount,
-         (unsigned)kDiFakeButtonCount, 1u);
+  InterlockedExchangeAdd64(&g_diCapsCalls, 1);
   return DI_OK;
 }
 
@@ -3576,8 +3580,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiEnumObjects(void*, void* cb, LPVOID ctx,
                                                    DWORD flags) {
   if (!cb)
     return DIERR_INVALIDPARAM;
-  if (InterlockedExchangeAdd64(&g_diObjCalls, 1) == 0)
-    Dlog("di8: fake device EnumObjects (first) flags=%08x", (unsigned)flags);
+  InterlockedExchangeAdd64(&g_diObjCalls, 1);
   const bool wide = g_diFakeWide == 1;
   const DWORD kind = flags & 0xFF;
   if (kind == 0 || (kind & DIDFT_AXIS) != 0) {
@@ -3667,15 +3670,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiGetProperty(void*, REFGUID rguid,
  */
 static HRESULT STDMETHODCALLTYPE FakeDiSetProperty(void*, REFGUID pguid,
                                                    LPCDIPROPHEADER header) {
-  if (InterlockedExchangeAdd64(&g_diSetPropCalls, 1) == 0) {
-    const ULONG_PTR id = reinterpret_cast<ULONG_PTR>(&pguid);
-    DWORD data = 0;
-    if (header && header->dwSize == sizeof(DIPROPDWORD))
-      data = reinterpret_cast<const DIPROPDWORD*>(header)->dwData;
-    Dlog("di8: fake device SetProperty (first) prop=%llu size=%u data=%u",
-         (unsigned long long)id, header ? (unsigned)header->dwSize : 0u,
-         (unsigned)data);
-  }
+  InterlockedExchangeAdd64(&g_diSetPropCalls, 1);
   return DI_OK;
 }
 
@@ -3687,8 +3682,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiSetProperty(void*, REFGUID pguid,
 static HRESULT STDMETHODCALLTYPE FakeDiAcquire(void*) {
   if (!FakeArmed())
     return DIERR_INPUTLOST;
-  if (InterlockedExchangeAdd64(&g_diAcquireCalls, 1) == 0)
-    Dlog("di8: fake device Acquire (first)");
+  InterlockedExchangeAdd64(&g_diAcquireCalls, 1);
   return DI_OK;
 }
 
@@ -3700,8 +3694,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiAcquire(void*) {
 static HRESULT STDMETHODCALLTYPE FakeDiUnacquire(void*) {
   if (!FakeArmed())
     return DIERR_INPUTLOST;
-  if (InterlockedExchangeAdd64(&g_diUnacquireCalls, 1) == 0)
-    Dlog("di8: fake device Unacquire (first)");
+  InterlockedExchangeAdd64(&g_diUnacquireCalls, 1);
   return DI_OK;
 }
 
@@ -3725,10 +3718,6 @@ static HRESULT STDMETHODCALLTYPE FakeDiGetDeviceState(void*, DWORD size,
   if (!data || size == 0)
     return DIERR_INVALIDPARAM;
   InterlockedIncrement64(&g_diStateCalls);
-  static volatile LONG first = 0;
-  if (InterlockedCompareExchange(&first, 1, 0) == 0)
-    Dlog("di8: fake device GetDeviceState called (first) size=%u",
-         (unsigned)size);
   const XINPUT_GAMEPAD pad = FakeDiCurrentPad();
   BYTE* out = (BYTE*)data;
 
@@ -3822,9 +3811,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiGetDeviceData(void*, DWORD dataSize,
                                                      DWORD flags) {
   if (!FakeArmed())
     return DIERR_INPUTLOST;
-  if (InterlockedExchangeAdd64(&g_diDataCalls, 1) == 0)
-    Dlog("di8: fake device GetDeviceData (first) dataSize=%u inOut=%u flags=%u",
-         (unsigned)dataSize, inOut ? (unsigned)*inOut : 0u, (unsigned)flags);
+  InterlockedExchangeAdd64(&g_diDataCalls, 1);
   if (inOut)
     *inOut = 0;
   return DI_OK;
@@ -3844,16 +3831,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiSetDataFormat(void*,
      auto-rescan observation loop treats this (with no WMI adoption) as a
      "stuck on DirectInput" retract signal. */
   InterlockedExchange64(&g_fakeDiBound, 1);
-  if (InterlockedExchangeAdd64(&g_diFormatCalls, 1) == 0 && format) {
-    Dlog("di8: fake device SetDataFormat (first) numObjs=%u dataSize=%u",
-         (unsigned)format->dwNumObjs, (unsigned)format->dwDataSize);
-    for (DWORD i = 0; i < format->dwNumObjs && i < 32; ++i) {
-      const DIOBJECTDATAFORMAT& od = format->rgodf[i];
-      Dlog("di8:   obj[%u] ofs=%u type=%08x guid=%08x", (unsigned)i,
-           (unsigned)od.dwOfs, (unsigned)od.dwType,
-           od.pguid ? (unsigned)od.pguid->Data1 : 0u);
-    }
-  }
+  InterlockedExchangeAdd64(&g_diFormatCalls, 1);
   if (format && format->rgodf && format->dwNumObjs) {
     g_diFakeFormat = *format;
     InterlockedExchange(&g_diFakeHasFormat, 1);
@@ -3868,9 +3846,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiSetDataFormat(void*,
  * @return DI_OK.
  */
 static HRESULT STDMETHODCALLTYPE FakeDiSetEventNotification(void*, HANDLE h) {
-  if (InterlockedExchangeAdd64(&g_diEventCalls, 1) == 0)
-    Dlog("di8: fake device SetEventNotification (first) handle=%d",
-         (int)(h != nullptr));
+  InterlockedExchangeAdd64(&g_diEventCalls, 1);
   return DI_OK;
 }
 
@@ -3885,9 +3861,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiSetCooperativeLevel(void*, HWND,
                                                            DWORD flags) {
   if (!FakeArmed())
     return DIERR_INPUTLOST;
-  if (InterlockedExchangeAdd64(&g_diCoopCalls, 1) == 0)
-    Dlog("di8: fake device SetCooperativeLevel (first) flags=%08x",
-         (unsigned)flags);
+  InterlockedExchangeAdd64(&g_diCoopCalls, 1);
   return DI_OK;
 }
 
@@ -3949,11 +3923,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiGetObjectInfo(void* self, void* obj,
   }
   if (!g)
     return DIERR_OBJECTNOTFOUND;
-  if (InterlockedExchangeAdd64(&g_diObjInfoCalls, 1) == 0)
-    Dlog("di8: fake device GetObjectInfo (first) how=%08x dwHow=%u reply "
-         "ofs=%u type=%08x name=%s",
-         (unsigned)how, (unsigned)dwHow, (unsigned)ofs, (unsigned)type,
-         na[0] ? na : "Axis");
+  InterlockedExchangeAdd64(&g_diObjInfoCalls, 1);
   const DWORD flags =
       ((type & DIDFT_AXIS) != 0) ? (DIDOI_POLLED | DIDOI_ASPECTPOSITION) : 0;
   if (wide) {
@@ -3987,12 +3957,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiGetDeviceInfo(void* self, void* inst) {
   if (!inst)
     return DIERR_INVALIDPARAM;
   const DWORD size = *(DWORD*)inst;
-  if (InterlockedExchangeAdd64(&g_diInfoCalls, 1) == 0)
-    Dlog("di8: fake device GetDeviceInfo (first) size=%u inst=%08lx prod=%08lx "
-         "devtype=%04x name=%S",
-         (unsigned)size, (unsigned long)FakeDiInstanceGuid().Data1,
-         (unsigned long)kDiGuidFakeProduct.Data1, (unsigned)kDiFakeDevType,
-         L"Xbox 360 Controller");
+  InterlockedExchangeAdd64(&g_diInfoCalls, 1);
   if (size == sizeof(DIDEVICEINSTANCEW)) {
     DIDEVICEINSTANCEW* d = (DIDEVICEINSTANCEW*)inst;
     d->guidInstance = FakeDiInstanceGuid();
@@ -4103,8 +4068,7 @@ static HRESULT STDMETHODCALLTYPE FakeDiEscape(void*, LPDIEFFESCAPE) {
 static HRESULT STDMETHODCALLTYPE FakeDiPoll(void*) {
   if (!FakeArmed())
     return DIERR_INPUTLOST;
-  if (InterlockedExchangeAdd64(&g_diPollCalls, 1) == 0)
-    Dlog("di8: fake device Poll (first)");
+  InterlockedExchangeAdd64(&g_diPollCalls, 1);
   return DI_OK;
 }
 
@@ -4268,8 +4232,7 @@ static void FakeDiFillInstance(void* inst, bool wide) {
 static HRESULT STDMETHODCALLTYPE DiCreateDeviceW_Hook(void* self, REFGUID guid,
                                                       void** out, void* outer) {
   if (g_diFakeOn == 1 && FakeArmed() && out && IsFakeDiGuid(guid)) {
-    if (InterlockedExchangeAdd64(&g_diCreateCalls, 1) == 0)
-      Dlog("di8: [W] CreateDevice(fake) called (first)");
+    InterlockedExchangeAdd64(&g_diCreateCalls, 1);
     InterlockedExchange(&g_diFakeWide, 1);
     EnsureFakeDiDevice();
     *out = &g_diFakeDevice;
@@ -4290,8 +4253,7 @@ static HRESULT STDMETHODCALLTYPE DiCreateDeviceW_Hook(void* self, REFGUID guid,
 static HRESULT STDMETHODCALLTYPE DiCreateDeviceA_Hook(void* self, REFGUID guid,
                                                       void** out, void* outer) {
   if (g_diFakeOn == 1 && FakeArmed() && out && IsFakeDiGuid(guid)) {
-    if (InterlockedExchangeAdd64(&g_diCreateCalls, 1) == 0)
-      Dlog("di8: [A] CreateDevice(fake) called (first)");
+    InterlockedExchangeAdd64(&g_diCreateCalls, 1);
     InterlockedExchange(&g_diFakeWide, 0);
     EnsureFakeDiDevice();
     *out = &g_diFakeDevice;
@@ -4313,10 +4275,7 @@ static HRESULT STDMETHODCALLTYPE DiCreateDeviceA_Hook(void* self, REFGUID guid,
 static HRESULT STDMETHODCALLTYPE DiEnumDevicesW_Hook(void* self, DWORD devClass,
                                                      void* cb, LPVOID ctx,
                                                      DWORD flags) {
-  const LONG64 prior = InterlockedExchangeAdd64(&g_diEnumCalls, 1);
-  if (prior == 0)
-    Dlog("di8: [W] EnumDevices called (first) class=%u flags=%u",
-         (unsigned)devClass, (unsigned)flags);
+  InterlockedExchangeAdd64(&g_diEnumCalls, 1);
   const HRESULT hr = g_realDiEnumDevicesW(self, devClass, cb, ctx, flags);
   if (g_diFakeOn != 1 || !FakeArmed() || !cb || FAILED(hr))
     return hr;
@@ -4341,10 +4300,7 @@ static HRESULT STDMETHODCALLTYPE DiEnumDevicesW_Hook(void* self, DWORD devClass,
 static HRESULT STDMETHODCALLTYPE DiEnumDevicesA_Hook(void* self, DWORD devClass,
                                                      void* cb, LPVOID ctx,
                                                      DWORD flags) {
-  const LONG64 prior = InterlockedExchangeAdd64(&g_diEnumCalls, 1);
-  if (prior == 0)
-    Dlog("di8: [A] EnumDevices called (first) class=%u flags=%u",
-         (unsigned)devClass, (unsigned)flags);
+  InterlockedExchangeAdd64(&g_diEnumCalls, 1);
   const HRESULT hr = g_realDiEnumDevicesA(self, devClass, cb, ctx, flags);
   if (g_diFakeOn != 1 || !FakeArmed() || !cb || FAILED(hr))
     return hr;
@@ -4577,10 +4533,7 @@ static UINT RawFakeDeviceInfo(LPVOID data, PUINT size) {
  * @return Bytes copied, 0 for a size probe, (UINT)-1 on error.
  */
 static UINT RawFakeInfoReply(UINT cmd, LPVOID data, PUINT size, bool wide) {
-  const LONG64 prior = InterlockedIncrement64(&g_rawInfoCalls);
-  if (prior == 1)
-    Dlog("raw-input: fake device info queried (first) cmd=%u wide=%d",
-         (unsigned)cmd, wide ? 1 : 0);
+  InterlockedIncrement64(&g_rawInfoCalls);
   switch (cmd) {
   case RIDI_DEVICENAME:
     return RawFakeDeviceName(data, size, wide);
@@ -4650,7 +4603,7 @@ static UINT WINAPI MyGetRawInputDeviceInfoA(HANDLE hDev, UINT cmd, LPVOID data,
  */
 static UINT WINAPI MyGetRawInputDeviceList(PRAWINPUTDEVICELIST list, PUINT num,
                                            UINT cb) {
-  const LONG64 prior = InterlockedIncrement64(&g_rawListCalls);
+  InterlockedIncrement64(&g_rawListCalls);
   if (g_realGetRawInputDeviceList == 0) {
     if (num)
       *num = 0;
@@ -4660,9 +4613,6 @@ static UINT WINAPI MyGetRawInputDeviceList(PRAWINPUTDEVICELIST list, PUINT num,
   g_realGetRawInputDeviceList(NULL, &realCount, cb);
   const bool armed = FakeArmed();
   const UINT total = realCount + (g_rawFakeOn == 1 && armed ? 1u : 0u);
-  if (prior == 1)
-    Dlog("raw-input: GetRawInputDeviceList called (first) real=%u fake=%d total=%u",
-         (unsigned)realCount, g_rawFakeOn, (unsigned)total);
   if (!list) {
     if (num)
       *num = total;
@@ -4781,7 +4731,7 @@ static const wchar_t kFakePnpClass[] = L"Win32_PNPEntity";
 /// The synthetic entity's DeviceID, carrying the IG_ XInput marker.
 static const wchar_t kFakePnpDeviceId[] = L"HID\\VID_045E&PID_028E&IG_00\\7&1&0&0000";
 
-/// WMI hook-hit counter; also gates the capped per-call logs.
+/// Live WMI hook-hit counter (reported as "wmicalls" in the heartbeat).
 static volatile LONG g_wmiCallLog = 0;
 
 /**
@@ -4798,18 +4748,10 @@ static void WmiLog(const char* fmt, ...) {
 }
 
 /**
- * @brief Log a live WMI hook hit, capped so a polling game cannot flood.
- * @param fmt printf-style format.
+ * @brief Note a live WMI hook hit; counted, never logged.
  */
-static void WmiLogCall(const char* fmt, ...) {
-  if (InterlockedIncrement(&g_wmiCallLog) > 60)
-    return;
-  char buf[512];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-  Dlog("%s", buf);
+static void WmiNoteCall(void) {
+  InterlockedIncrement(&g_wmiCallLog);
 }
 
 /// Minimal fake IWbemClassObject (vtable + refs).
@@ -5155,8 +5097,6 @@ static WmiImpl* FindWmiImpl(IWbemServices* self, int slot) {
       if (known != nullptr && known == target)
         return &g_wmiImpls[i];
     }
-    WmiLogCall("WMI: unregistered impl for slot%d target=%p - falling back to impl0", slot,
-               target);
   }
   return &g_wmiImpls[0];
 }
@@ -5168,7 +5108,7 @@ static HRESULT STDMETHODCALLTYPE WbemCreateInstanceEnum_Hook(IWbemServices* self
   WmiImpl* impl = FindWmiImpl(self, 18);
   if (impl == nullptr || impl->enumOrig == nullptr)
     return E_FAIL;
-  WmiLogCall("WMI: CreateInstanceEnum called class=%ls", className != nullptr ? className : L"(null)");
+  WmiNoteCall();
   // The game's own "is this DI pad actually an XInput pad?" filter uses this
   // exact class. Seeing it while armed means the pad is being routed through
   // the XInput path - the auto-rescan retry loop's success signal.
@@ -5201,7 +5141,7 @@ static HRESULT STDMETHODCALLTYPE WbemExecQuery_Hook(IWbemServices* self, BSTR la
   WmiImpl* impl = FindWmiImpl(self, 20);
   if (impl == nullptr || impl->queryOrig == nullptr)
     return E_FAIL;
-  WmiLogCall("WMI: ExecQuery called query=%ls", query != nullptr ? query : L"(null)");
+  WmiNoteCall();
   if (g_xinputFakeOn == 1 && FakeArmed() && query != nullptr &&
       wcsstr(query, kFakePnpClass) != nullptr) {
     InterlockedExchange64(&g_wmiPnpQueried, 1);
@@ -5224,9 +5164,9 @@ static HRESULT STDMETHODCALLTYPE WbemExecQuery_Hook(IWbemServices* self, BSTR la
   return S_OK;
 }
 
-// The async twins are logged, never wrapped: their results are delivered
+// The async twins are counted, never wrapped: their results are delivered
 // through IWbemObjectSink::Indicate, so injecting the synthetic entity would
-// mean wrapping the sink too. Log-only until a run shows this path being used.
+// mean wrapping the sink too.
 static HRESULT STDMETHODCALLTYPE WbemCreateInstanceEnumAsync_Hook(IWbemServices* self,
                                                                   BSTR className, LONG flags,
                                                                   IWbemContext* context,
@@ -5234,8 +5174,7 @@ static HRESULT STDMETHODCALLTYPE WbemCreateInstanceEnumAsync_Hook(IWbemServices*
   WmiImpl* impl = FindWmiImpl(self, 19);
   if (impl == nullptr || impl->enumAsyncOrig == nullptr)
     return E_FAIL;
-  WmiLogCall("WMI: CreateInstanceEnumAsync called class=%ls",
-             className != nullptr ? className : L"(null)");
+  WmiNoteCall();
   return impl->enumAsyncOrig(self, className, flags, context, handler);
 }
 static HRESULT STDMETHODCALLTYPE WbemExecQueryAsync_Hook(IWbemServices* self, BSTR language,
@@ -5245,7 +5184,7 @@ static HRESULT STDMETHODCALLTYPE WbemExecQueryAsync_Hook(IWbemServices* self, BS
   WmiImpl* impl = FindWmiImpl(self, 21);
   if (impl == nullptr || impl->queryAsyncOrig == nullptr)
     return E_FAIL;
-  WmiLogCall("WMI: ExecQueryAsync called query=%ls", query != nullptr ? query : L"(null)");
+  WmiNoteCall();
   return impl->queryAsyncOrig(self, language, query, flags, context, handler);
 }
 
@@ -5612,8 +5551,31 @@ static const wchar_t kFakeHidDevicePath[] =
     L"\\\\?\\HID#VID_045E&PID_028E&IG_00#7&1&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
 /// Sentinel handle our hooks recognise as the virtual HID device ("HIDX").
 static const HANDLE kFakeHidHandle = (HANDLE)0x48494458u;
-/// Synthetic preparsed-data sentinel for the HidP hooks ("PREP").
-static const PHIDP_PREPARSED_DATA kFakePreparsedData = (PHIDP_PREPARSED_DATA)0x50524550u;
+/**
+ * Pointer handed back as the virtual device's preparsed data.
+ *
+ * The real HidP_* parsers dereference whatever pointer HidD_GetPreparsedData
+ * returns, so this MUST be a mapped address. A bogus unmapped constant (as was
+ * used here before) faults the moment a parser this build never hooks - or
+ * could not hook, because its prologue could not be relocated on that OS build
+ * - receives it, which killed the game right after injection. A zeroed,
+ * process-lifetime block instead makes those parsers fail validation and
+ * return HIDP_STATUS_INVALID_PREPARSED_DATA.
+ */
+static PHIDP_PREPARSED_DATA g_fakePreparsedData = nullptr;
+
+/**
+ * @brief Allocate the mapped stand-in used as the virtual device's preparsed
+ * data (idempotent, called once from HidSetupDiHookInstall before any hook is
+ * live).
+ */
+static void FakePreparsedDataInit(void) {
+  if (g_fakePreparsedData != nullptr)
+    return;
+  void* buf = calloc(1, 0x10000); // 64 KiB zeroed: validation fails, reads stay mapped
+  if (buf != nullptr)
+    g_fakePreparsedData = (PHIDP_PREPARSED_DATA)buf;
+}
 
 /// Shared per-process budget for the HID fake answer logs.
 static volatile LONG g_hidFakeLogBudget = 24;
@@ -6093,16 +6055,17 @@ static BOOLEAN WINAPI HidD_GetAttributes_Hook(HANDLE hidDeviceObject, PHIDD_ATTR
 
 static BOOLEAN WINAPI HidD_GetPreparsedData_Hook(HANDLE hidDeviceObject,
                                                  PHIDP_PREPARSED_DATA* preparsedData) {
-  if (hidDeviceObject == kFakeHidHandle && preparsedData != nullptr) {
-    *preparsedData = kFakePreparsedData;
-    HidLogFake("hid: HidD_GetPreparsedData fake -> sentinel");
+  if (hidDeviceObject == kFakeHidHandle && preparsedData != nullptr &&
+      g_fakePreparsedData != nullptr) {
+    *preparsedData = g_fakePreparsedData;
+    HidLogFake("hid: HidD_GetPreparsedData fake -> mapped stand-in");
     return TRUE;
   }
   return g_realHidDGetPreparsedData(hidDeviceObject, preparsedData);
 }
 
 static BOOLEAN WINAPI HidD_FreePreparsedData_Hook(PHIDP_PREPARSED_DATA preparsedData) {
-  if (preparsedData == kFakePreparsedData)
+  if (preparsedData != nullptr && preparsedData == g_fakePreparsedData)
     return TRUE;
   return g_realHidDFreePreparsedData(preparsedData);
 }
@@ -6111,7 +6074,7 @@ static BOOLEAN WINAPI HidD_FreePreparsedData_Hook(PHIDP_PREPARSED_DATA preparsed
 // (X, Y, Rx, Ry = 16-bit sticks; Z, Rz = 8-bit triggers), 20-byte input report,
 // 8-byte LED output report. If DMC5 checks any cap counts this must look real.
 static NTSTATUS WINAPI HidP_GetCaps_Hook(PHIDP_PREPARSED_DATA preparsedData, PHIDP_CAPS caps) {
-  if (preparsedData == kFakePreparsedData && caps != nullptr) {
+  if (preparsedData != nullptr && preparsedData == g_fakePreparsedData && caps != nullptr) {
     memset(caps, 0, sizeof(HIDP_CAPS));
     caps->Usage = 0x05; // Generic Desktop / Game Pad
     caps->UsagePage = 0x01;
@@ -6137,7 +6100,7 @@ static NTSTATUS WINAPI HidP_GetCaps_Hook(PHIDP_PREPARSED_DATA preparsedData, PHI
 static NTSTATUS WINAPI HidP_GetValueCaps_Hook(HIDP_REPORT_TYPE reportType,
                                               PHIDP_VALUE_CAPS valueCaps, PUSHORT valueCapsLength,
                                               PHIDP_PREPARSED_DATA preparsedData) {
-  if (preparsedData == kFakePreparsedData) {
+  if (preparsedData != nullptr && preparsedData == g_fakePreparsedData) {
     if (reportType != HidP_Input || valueCapsLength == nullptr) {
       if (valueCapsLength != nullptr)
         *valueCapsLength = 0;
@@ -6190,7 +6153,7 @@ static NTSTATUS WINAPI HidP_GetButtonCaps_Hook(HIDP_REPORT_TYPE reportType,
                                                PHIDP_BUTTON_CAPS buttonCaps,
                                                PUSHORT buttonCapsLength,
                                                PHIDP_PREPARSED_DATA preparsedData) {
-  if (preparsedData == kFakePreparsedData) {
+  if (preparsedData != nullptr && preparsedData == g_fakePreparsedData) {
     if (reportType != HidP_Input || buttonCapsLength == nullptr) {
       if (buttonCapsLength != nullptr)
         *buttonCapsLength = 0;
@@ -6399,6 +6362,7 @@ static void HidSetupDiHookInstall(void) {
   InterlockedExchange(&g_hidFakeLogBudget, 24);
   HidDevInfoLockInit();
   InterlockedExchange(&g_fakeDevInfoSetCount, 0);
+  FakePreparsedDataInit();
 
   HMODULE setupapi = GetModuleHandleW(L"setupapi.dll");
   HMODULE hid = GetModuleHandleW(L"hid.dll");
@@ -6558,6 +6522,2242 @@ static void HidSetupDiHookRestore(void) {
                 g_exportGetOverlappedResult);
   DetourRestore(&g_hidDetIoControl, (void**)&g_realDeviceIoControl, g_exportDeviceIoControl);
   Dlog("hid: SetupDi + HID hooks restored");
+}
+
+/* ------------------------------------------------------------------ */
+/* Windows.Gaming.Input fake gamepad (XInputFakeWgi=1)                */
+/* ------------------------------------------------------------------ */
+/* UE5 titles (Split Fiction among them) read the controller through
+   Windows.Gaming.Input instead of XInput: the WinRT Gamepad statics
+   enumerate and serve state from system code behind combase, so the
+   game never calls an XInput export and the whole XInput-side illusion
+   is invisible to it. This layer detours combase!RoGetActivationFactory
+   for L"Windows.Gaming.Input.Gamepad" and hands the game a fake statics
+   object. get_Gamepads passes the REAL system view through whenever the
+   OS actually has a controller (a real pad always wins) and otherwise
+   presents ONE connected fake pad; the pad's GetCurrentReading is fed
+   from the same loopback UDP snapshots as the XInput rewrite, and its
+   rumble writes are consumed rather than forwarded. Every other
+   Windows.Gaming.Input class (RawGameController and friends) passes
+   through untouched, but each class name is logged once so a live
+   session shows which other WinRT input surfaces the title touches. */
+
+/** HSTRING stand-in: WinRT string handles stay opaque to this layer. */
+typedef void* WgiHstring;
+
+/** WinRT EventRegistrationToken: one int64 field, passed by value. */
+struct WgiEventToken {
+  int64_t value; ///< Opaque per-subscription token.
+};
+
+/* Interface IIDs (SDK 10.0.26100 winrt/windows.gaming.input.h, including
+   the parameterized collection instantiations). */
+static const GUID kWgiIidUnknown = {0x00000000, 0x0000, 0x0000,
+                                    {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID kWgiIidInspectable = {0xaf86e235, 0x12b5, 0x4c6a,
+                                        {0x9c, 0x5a, 0xd7, 0xaa, 0x65, 0x10, 0x1e, 0x90}};
+static const GUID kWgiIidActivationFactory = {0x00000035, 0x0000, 0x0000,
+                                              {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID kWgiIidIGamepadStatics = {0x8bbce529, 0xd49c, 0x39e9,
+                                            {0x95, 0x60, 0xe4, 0x7d, 0xde, 0x96, 0xb7, 0xc8}};
+static const GUID kWgiIidIGamepadStatics2 = {0x42676dc5, 0x0856, 0x47c4,
+                                             {0x92, 0x13, 0xb3, 0x95, 0x50, 0x4c, 0x3a, 0x3c}};
+static const GUID kWgiIidIGamepad = {0xbc7bb43c, 0x0a69, 0x3903,
+                                     {0x9e, 0x9d, 0xa5, 0x0f, 0x86, 0xa4, 0x5d, 0xe5}};
+static const GUID kWgiIidIGamepad2 = {0x3c1689bd, 0x5915, 0x4245,
+                                      {0xb0, 0xc0, 0xc8, 0x9f, 0xae, 0x03, 0x08, 0xff}};
+static const GUID kWgiIidIGameController = {0x1baf6522, 0x5f64, 0x42c5,
+                                            {0x82, 0x67, 0xb9, 0xfe, 0x22, 0x15, 0xbf, 0xbd}};
+static const GUID kWgiIidIGameControllerBatteryInfo = {0xdcecc681, 0x3963, 0x4da6,
+                                                        {0x95, 0x5d, 0x55, 0x3f, 0x3b, 0x6f, 0x61, 0x61}};
+static const GUID kWgiIidVectorViewGamepad = {0xeb97bb69, 0x09c9, 0x5a99,
+                                              {0x86, 0xb2, 0x3e, 0x36, 0x08, 0x52, 0x84, 0xd4}};
+static const GUID kWgiIidIterableGamepad = {0x47132ba0, 0x6b17, 0x5cd2,
+                                            {0xa8, 0xbd, 0xb5, 0xd3, 0x44, 0x3c, 0xcb, 0x13}};
+static const GUID kWgiIidIteratorGamepad = {0x246737e8, 0x12bc, 0x5c64,
+                                             {0xaf, 0x52, 0x06, 0xdb, 0x4b, 0x13, 0xfa, 0x2f}};
+
+/* RawGameController interface IIDs (SDK 10.0.26100 winrt/windows.gaming.input.h).
+   UE5 discovers and reads controllers through IRawGameController, not IGamepad:
+   the engine subscribes to RawGameControllerAdded and calls GetCurrentReading on
+   the raw controller, so the Gamepad-only fake is invisible to it. These IIDs
+   drive the parallel RawGameController statics/pad fake below. */
+static const GUID kWgiIidIRawGameController = {0x7cad6d91, 0xa7e1, 0x4f71,
+    {0x9a, 0x78, 0x33, 0xe9, 0xc5, 0xdf, 0xea, 0x62}};
+static const GUID kWgiIidIRawGameController2 = {0x43c0c035, 0xbb73, 0x4756,
+    {0xa7, 0x87, 0x3e, 0xd6, 0xbe, 0xa6, 0x17, 0xbd}};
+static const GUID kWgiIidIRawGameControllerStatics = {0xeb8d0792, 0xe95a, 0x4b19,
+    {0xaf, 0xc7, 0x0a, 0x59, 0xf8, 0xbf, 0x75, 0x9e}};
+
+/* XInput button masks (XINPUT_GAMEPAD_*), declared locally so the layer is
+   independent of the SDK header's include state. */
+static const WORD kWgiXiDpadUp = 0x0001;         ///< XINPUT_GAMEPAD_DPAD_UP.
+static const WORD kWgiXiDpadDown = 0x0002;       ///< XINPUT_GAMEPAD_DPAD_DOWN.
+static const WORD kWgiXiDpadLeft = 0x0004;       ///< XINPUT_GAMEPAD_DPAD_LEFT.
+static const WORD kWgiXiDpadRight = 0x0008;      ///< XINPUT_GAMEPAD_DPAD_RIGHT.
+static const WORD kWgiXiStart = 0x0010;          ///< XINPUT_GAMEPAD_START.
+static const WORD kWgiXiBack = 0x0020;           ///< XINPUT_GAMEPAD_BACK.
+static const WORD kWgiXiLeftThumb = 0x0040;      ///< XINPUT_GAMEPAD_LEFT_THUMB.
+static const WORD kWgiXiRightThumb = 0x0080;     ///< XINPUT_GAMEPAD_RIGHT_THUMB.
+static const WORD kWgiXiLeftShoulder = 0x0100;   ///< XINPUT_GAMEPAD_LEFT_SHOULDER.
+static const WORD kWgiXiRightShoulder = 0x0200;  ///< XINPUT_GAMEPAD_RIGHT_SHOULDER.
+static const WORD kWgiXiA = 0x1000;              ///< XINPUT_GAMEPAD_A.
+static const WORD kWgiXiB = 0x2000;              ///< XINPUT_GAMEPAD_B.
+static const WORD kWgiXiX = 0x4000;              ///< XINPUT_GAMEPAD_X.
+static const WORD kWgiXiY = 0x8000;              ///< XINPUT_GAMEPAD_Y.
+
+/* GamepadButtons flags (Windows.Gaming.Input ABI). */
+static const std::uint32_t kWgiBtnMenu = 0x0001;          ///< Menu (Start).
+static const std::uint32_t kWgiBtnView = 0x0002;           ///< View (Back).
+static const std::uint32_t kWgiBtnA = 0x0004;              ///< A button.
+static const std::uint32_t kWgiBtnB = 0x0008;              ///< B button.
+static const std::uint32_t kWgiBtnX = 0x0010;              ///< X button.
+static const std::uint32_t kWgiBtnY = 0x0020;              ///< Y button.
+static const std::uint32_t kWgiBtnDpadUp = 0x0040;         ///< D-pad up.
+static const std::uint32_t kWgiBtnDpadDown = 0x0080;       ///< D-pad down.
+static const std::uint32_t kWgiBtnDpadLeft = 0x0100;       ///< D-pad left.
+static const std::uint32_t kWgiBtnDpadRight = 0x0200;      ///< D-pad right.
+static const std::uint32_t kWgiBtnLeftShoulder = 0x0400;   ///< Left shoulder.
+static const std::uint32_t kWgiBtnRightShoulder = 0x0800;  ///< Right shoulder.
+static const std::uint32_t kWgiBtnLeftThumb = 0x1000;      ///< Left stick press.
+static const std::uint32_t kWgiBtnRightThumb = 0x2000;     ///< Right stick press.
+
+/**
+ * @brief Windows.Gaming.Input.GamepadReading: one controller snapshot.
+ */
+struct WgiGamepadReading {
+  std::uint64_t Timestamp;     ///< Reading time in microseconds (QPC clock).
+  std::uint32_t Buttons;       ///< GamepadButtons flags.
+  double LeftTrigger;          ///< Left trigger, 0..1.
+  double RightTrigger;         ///< Right trigger, 0..1.
+  double LeftThumbstickX;      ///< Left stick X, -1..1.
+  double LeftThumbstickY;      ///< Left stick Y, -1..1.
+  double RightThumbstickX;     ///< Right stick X, -1..1.
+  double RightThumbstickY;     ///< Right stick Y, -1..1.
+};
+
+/**
+ * @brief Windows.Gaming.Input.GamepadVibration: rumble levels.
+ */
+struct WgiGamepadVibration {
+  double LeftMotor;    ///< Low-frequency motor, 0..1.
+  double RightMotor;   ///< High-frequency motor, 0..1.
+  double LeftTrigger;  ///< Left trigger actuator, 0..1.
+  double RightTrigger; ///< Right trigger actuator, 0..1.
+};
+
+/**
+ * @brief Minimal IInspectable: the six vtable slots every WinRT interface
+ * starts with.
+ */
+struct WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) = 0;
+  virtual ULONG STDMETHODCALLTYPE AddRef() = 0;
+  virtual ULONG STDMETHODCALLTYPE Release() = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) = 0;
+};
+
+/**
+ * @brief IGamepad ABI (gamepad state and rumble).
+ */
+struct WgiIGamepad : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE get_Vibration(WgiGamepadVibration* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE put_Vibration(WgiGamepadVibration value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetCurrentReading(WgiGamepadReading* value) = 0;
+};
+
+/**
+ * @brief IGamepad2 ABI (per-button label probing).
+ */
+struct WgiIGamepad2 : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE GetButtonLabel(std::int32_t button,
+                                                   std::int32_t* value) = 0;
+};
+
+/**
+ * @brief IGameController ABI (headset / user plumbing shared by all pads).
+ */
+struct WgiIGameController : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE add_HeadsetConnected(void* value, WgiEventToken* token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE remove_HeadsetConnected(WgiEventToken token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE add_HeadsetDisconnected(void* value, WgiEventToken* token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE remove_HeadsetDisconnected(WgiEventToken token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE add_UserChanged(void* value, WgiEventToken* token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE remove_UserChanged(WgiEventToken token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_Headset(void** value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_IsWireless(unsigned char* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_User(void** value) = 0;
+};
+
+/**
+ * @brief IGameControllerBatteryInfo ABI.
+ */
+struct WgiIGameControllerBatteryInfo : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE TryGetBatteryReport(void** value) = 0;
+};
+
+/**
+ * @brief IEventHandler<Gamepad> ABI: the game's GamepadAdded/Removed callback.
+ */
+struct WgiIEventHandlerGamepad : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE Invoke(WgiIInspectable* sender,
+                                           WgiIGamepad* args) = 0;
+};
+
+/**
+ * @brief IIterator<Gamepad> ABI (one-pass enumeration cursor).
+ */
+struct WgiIIteratorGamepad : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE get_Current(WgiIGamepad** result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_HasCurrent(unsigned char* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE MoveNext(unsigned char* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t itemsLength,
+                                            WgiIGamepad** items,
+                                            std::uint32_t* result) = 0;
+};
+
+/**
+ * @brief IIterable<Gamepad> ABI (range-entry point; C++/WinRT's begin()).
+ */
+struct WgiIIterableGamepad : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE First(WgiIIteratorGamepad** result) = 0;
+};
+
+/**
+ * @brief IVectorView<Gamepad> ABI (the Gamepads list snapshot).
+ */
+struct WgiIVectorViewGamepad : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE GetAt(std::uint32_t index, WgiIGamepad** result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_Size(std::uint32_t* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE IndexOf(WgiIGamepad* value, std::uint32_t* index,
+                                            unsigned char* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t startIndex,
+                                            std::uint32_t itemsLength, WgiIGamepad** items,
+                                            std::uint32_t* result) = 0;
+};
+
+/**
+ * @brief IRawGameController ABI (generic button/axis/switch controller state).
+ *
+ * UE5 reads input through this interface rather than IGamepad: GetCurrentReading
+ * returns raw boolean button / double axis / switch arrays. The vtable order
+ * matches the SDK (winrt/windows.gaming.input.h) exactly.
+ */
+struct WgiIRawGameController : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE get_AxisCount(std::int32_t* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_ButtonCount(std::int32_t* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_ForceFeedbackMotors(void** value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_HardwareProductId(std::uint16_t* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_HardwareVendorId(std::uint16_t* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_SwitchCount(std::int32_t* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetButtonLabel(std::int32_t buttonIndex,
+                                                    std::int32_t* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetCurrentReading(std::uint32_t buttonArrayLength,
+                                                       unsigned char* buttonArray,
+                                                       std::uint32_t switchArrayLength,
+                                                       std::int32_t* switchArray,
+                                                       std::uint32_t axisArrayLength,
+                                                       double* axisArray,
+                                                       std::uint64_t* timestamp) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetSwitchKind(std::int32_t switchIndex,
+                                                   std::int32_t* value) = 0;
+};
+
+/**
+ * @brief IRawGameController2 ABI (display name / haptics, UE5 5.0+).
+ */
+struct WgiIRawGameController2 : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE get_SimpleHapticsControllers(void** value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_NonRoamableId(WgiHstring* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_DisplayName(WgiHstring* value) = 0;
+};
+
+/**
+ * @brief IEventHandler<RawGameController> ABI: the game's Added/Removed callback.
+ */
+struct WgiIEventHandlerRawGameController : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE Invoke(WgiIInspectable* sender,
+                                            WgiIRawGameController* args) = 0;
+};
+
+/**
+ * @brief IVectorView<RawGameController> ABI (the RawGameControllers list).
+ */
+struct WgiIVectorViewRawGameController : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE GetAt(std::uint32_t index,
+                                          WgiIRawGameController** result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_Size(std::uint32_t* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE IndexOf(WgiIRawGameController* value,
+                                            std::uint32_t* index,
+                                            unsigned char* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t startIndex,
+                                            std::uint32_t itemsLength,
+                                            WgiIRawGameController** items,
+                                            std::uint32_t* result) = 0;
+};
+
+/**
+ * @brief IIterable<RawGameController> ABI (range-for entry; First()).
+ */
+struct WgiIIteratorRawGameController; /* Forward: First() returns this cursor. */
+struct WgiIIterableRawGameController : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE First(WgiIIteratorRawGameController** result) = 0;
+};
+
+/**
+ * @brief IIterator<RawGameController> ABI (one-pass enumeration cursor).
+ */
+struct WgiIIteratorRawGameController : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE get_Current(WgiIRawGameController** result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_HasCurrent(unsigned char* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE MoveNext(unsigned char* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t itemsLength,
+                                            WgiIRawGameController** items,
+                                            std::uint32_t* result) = 0;
+};
+
+/**
+ * @brief IRawGameControllerStatics ABI (the RawGameController activation factory).
+ */
+struct WgiIRawGameControllerStatics : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE add_RawGameControllerAdded(
+      WgiIEventHandlerRawGameController* value, WgiEventToken* token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE remove_RawGameControllerAdded(WgiEventToken token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE add_RawGameControllerRemoved(
+      WgiIEventHandlerRawGameController* value, WgiEventToken* token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE remove_RawGameControllerRemoved(WgiEventToken token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_RawGameControllers(
+      WgiIVectorViewRawGameController** value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE FromGameController(void* gameController,
+                                                       WgiIRawGameController** value) = 0;
+};
+
+/**
+ * @brief Generic empty IVectorView<T> ABI for out-params that must be a valid
+ *        collection but hold no elements (ForceFeedbackMotors,
+ *        SimpleHapticsControllers). The element type is opaque at the ABI level
+ *        (GetAt returns T** as void**), so one implementation serves all T.
+ */
+struct WgiIVectorViewEmpty : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE GetAt(std::uint32_t index, void** result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_Size(std::uint32_t* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE IndexOf(void* value, std::uint32_t* index,
+                                            unsigned char* result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t startIndex,
+                                            std::uint32_t itemsLength, void** items,
+                                            std::uint32_t* result) = 0;
+};
+
+/**
+ * @brief IActivationFactory ABI (default activation entry of every statics).
+ */
+struct WgiIActivationFactory : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE ActivateInstance(WgiIInspectable** instance) = 0;
+};
+
+/**
+ * @brief IGamepadStatics ABI (the Gamepad runtime-class activation factory).
+ */
+struct WgiIGamepadStatics : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE add_GamepadAdded(WgiIEventHandlerGamepad* value,
+                                                    WgiEventToken* token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE remove_GamepadAdded(WgiEventToken token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE add_GamepadRemoved(WgiIEventHandlerGamepad* value,
+                                                       WgiEventToken* token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE remove_GamepadRemoved(WgiEventToken token) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_Gamepads(WgiIVectorViewGamepad** value) = 0;
+};
+
+/**
+ * @brief IGamepadStatics2 ABI (FromGameController).
+ */
+struct WgiIGamepadStatics2 : public WgiIInspectable {
+  virtual HRESULT STDMETHODCALLTYPE FromGameController(void* controller,
+                                                       WgiIGamepad** value) = 0;
+};
+
+/** Maximum stored GamepadAdded / GamepadRemoved handlers. */
+#define WGI_MAX_HANDLERS 8
+
+static CRITICAL_SECTION g_wgiLock;               ///< Guards all WGI mutable state.
+static volatile LONG g_wgiLockInit = 0;          ///< 1 after InitializeCriticalSection.
+static volatile LONG g_wgiInstalled = 0;         ///< 1 while the WGI fake layer is live.
+static volatile LONG64 g_wgiRoGetCalls = 0;      ///< Entries into the hooked factory resolver.
+static volatile LONG64 g_wgiGamepadActivations = 0; ///< Gamepad-class activations intercepted.
+static volatile LONG64 g_wgiListCalls = 0;        ///< get_Gamepads calls answered by the fake.
+static volatile LONG64 g_wgiReadCalls = 0;       ///< GetCurrentReading calls answered by the fake.
+static volatile LONG64 g_wgiServedFresh = 0;     ///< Readings served from a fresh UDP snapshot.
+static volatile LONG64 g_wgiAddedSubs = 0;        ///< GamepadAdded subscriptions taken.
+static volatile LONG64 g_wgiVibCalls = 0;        ///< Rumble writes consumed by the fake pad.
+static volatile LONG64 g_wgiListLogged = 0;      ///< One-shot: first get_Gamepads served.
+static volatile LONG64 g_wgiAddLogged = 0;       ///< One-shot: first add_GamepadAdded intercepted.
+static volatile LONG64 g_wgiReadLogged = 0;      ///< One-shot: first reading served.
+static volatile LONG64 g_wgiAddedLogged = 0;     ///< One-shot: first subscription taken.
+static volatile LONG64 g_wgiVibLogged = 0;       ///< One-shot: first rumble consumed.
+static volatile LONG64 g_wgiActLogged = 0;       ///< One-shot: first activation intercepted.
+static std::uint64_t g_wgiQpcFreqHz = 0;         ///< Cached QPC frequency for timestamps.
+static WgiGamepadVibration g_wgiVibration;       ///< Last rumble write (consumed, stored).
+static WgiIGamepadStatics* g_wgiRealStatics = nullptr;   ///< OS statics, for pass-through.
+static WgiIGamepadStatics2* g_wgiRealStatics2 = nullptr;  ///< OS FromGameController passthrough.
+static WgiIEventHandlerGamepad* g_wgiAddedHandlers[WGI_MAX_HANDLERS];   ///< Added callbacks.
+static WgiIEventHandlerGamepad* g_wgiRemovedHandlers[WGI_MAX_HANDLERS]; ///< Removed callbacks.
+static wchar_t g_wgiSeenNames[16][48];           ///< Already-logged WGI class names.
+static int g_wgiSeenCount = 0;                   ///< Number of names logged so far.
+static void** g_wgiOrigStaticsVtable = nullptr;  ///< Original IGamepadStatics vtable (for restore).
+static void** g_wgiFakeStaticsVtable = nullptr;  ///< Copied IGamepadStatics vtable with fake slots.
+static void** g_wgiOrigStatics2Vtable = nullptr; ///< Original IGamepadStatics2 vtable (for restore).
+static void** g_wgiFakeStatics2Vtable = nullptr; ///< Copied IGamepadStatics2 vtable with fake slots.
+
+/* RawGameController fake-layer state (parallel to the Gamepad fakes above).
+   UE5 discovers controllers through the RawGameControllerAdded event, so the
+   Added handler is fired once with the fake pad the moment the game subscribes
+   (real WGI never raises Added for pads already enumerable, but the fake pad is
+   materialized on demand, so the subscription is the only discovery signal). */
+#define WGI_MAX_RAW_HANDLERS 8
+static WgiIRawGameController* g_wgiFakeRawPadI = nullptr; ///< Fake raw pad subobject pointer.
+static WgiIRawGameControllerStatics* g_wgiRealRawStatics = nullptr; ///< OS statics, passthrough.
+static WgiIEventHandlerRawGameController* g_wgiRawAddedHandlers[WGI_MAX_RAW_HANDLERS];
+static WgiIEventHandlerRawGameController* g_wgiRawRemovedHandlers[WGI_MAX_RAW_HANDLERS];
+static volatile LONG g_wgiRawAddedFired = 0;  ///< 1 after the Added event was raised.
+static GUID g_wgiRawViewIids[4];              ///< Parameterized IIDs gleaned from the real view.
+static int g_wgiRawViewIidCount = 0;          ///< Valid entries in g_wgiRawViewIids.
+static volatile LONG64 g_wgiRawAddedSubs = 0; ///< RawGameControllerAdded subscriptions.
+static volatile LONG64 g_wgiRawListCalls = 0; ///< get_RawGameControllers calls answered.
+static volatile LONG64 g_wgiRawReadCalls = 0; ///< RawGameController GetCurrentReading calls.
+static volatile LONG64 g_wgiRawServedFresh = 0; ///< Raw readings from a fresh UDP snapshot.
+static volatile LONG64 g_wgiRawActLogged = 0; ///< One-shot: first RawGameController activation.
+static volatile LONG64 g_wgiRawListLogged = 0; ///< One-shot: first RawGameControllers served.
+static volatile LONG64 g_wgiRawReadLogged = 0; ///< One-shot: first raw reading served.
+static volatile LONG64 g_wgiRawAddedLogged = 0; ///< One-shot: first Added subscription fired.
+
+typedef HRESULT(WINAPI* FnWgiRoGetActivationFactory)(WgiHstring, REFIID, void**);
+typedef PCWSTR(WINAPI* FnWgiGetStringRawBuffer)(WgiHstring, UINT32*);
+typedef HRESULT(WINAPI* FnWgiCreateString)(PCWSTR, UINT32, WgiHstring*);
+typedef HRESULT(WINAPI* FnWgiDeleteString)(WgiHstring);
+
+static FnWgiRoGetActivationFactory g_realRoGetActivationFactory = nullptr; ///< Trampoline.
+static void* g_exportRoGetActivationFactory = nullptr; ///< combase export entry.
+static Detour g_detourRoGet;                     ///< Detour record for the resolver.
+static FnWgiGetStringRawBuffer g_wgiGetStringRawBuffer = nullptr; ///< HSTRING reader.
+static FnWgiCreateString g_wgiCreateString = nullptr;             ///< HSTRING builder.
+static FnWgiDeleteString g_wgiDeleteString = nullptr;             ///< HSTRING releaser.
+
+/**
+ * @brief Monotonic timestamp in microseconds, the WGI reading clock.
+ * @return Microseconds since an arbitrary fixed point (QPC-derived).
+ */
+static std::uint64_t WgiNowUs(void) {
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  if (g_wgiQpcFreqHz == 0)
+    return (std::uint64_t)now.QuadPart;
+  const std::uint64_t qpc = (std::uint64_t)now.QuadPart;
+  return (qpc / g_wgiQpcFreqHz) * 1000000ull +
+         ((qpc % g_wgiQpcFreqHz) * 1000000ull) / g_wgiQpcFreqHz;
+}
+
+/**
+ * @brief Snapshot of XInput slot 0 with the same precedence the XInput
+ * rewrite uses: a fresh UDP snapshot wins, otherwise the neutral pad.
+ * @param[out] freshOut Set true when a snapshot inside the freshness window
+ * was served (false = neutral fake state).
+ * @return The gamepad state to present through WGI.
+ */
+static XINPUT_GAMEPAD WgiSourceState(bool* freshOut) {
+  if (freshOut != nullptr)
+    *freshOut = false;
+  XINPUT_GAMEPAD g = g_xinputFakeNeutralPad;
+  if (g_xinputLockInit == 1) {
+    EnterCriticalSection(&g_xinputLock);
+    const LONG64 ts = g_xinputSlots[0].timestamp;
+    if (ts != 0 && (GetTickCount64() - ts) < XINPUT_UDP_FRESH_MS) {
+      g = g_xinputSlots[0].gamepad;
+      if (freshOut != nullptr)
+        *freshOut = true;
+    }
+    LeaveCriticalSection(&g_xinputLock);
+  }
+  return g;
+}
+
+/**
+ * @brief Map an XINPUT_GAMEPAD snapshot to the WGI GamepadReading layout.
+ * @param g The XInput-side state.
+ * @param[out] out The WGI reading to fill (timestamp from the QPC clock).
+ */
+static void WgiFillReading(const XINPUT_GAMEPAD& g, WgiGamepadReading* out) {
+  std::uint32_t b = 0;
+  if (g.wButtons & kWgiXiDpadUp) b |= kWgiBtnDpadUp;
+  if (g.wButtons & kWgiXiDpadDown) b |= kWgiBtnDpadDown;
+  if (g.wButtons & kWgiXiDpadLeft) b |= kWgiBtnDpadLeft;
+  if (g.wButtons & kWgiXiDpadRight) b |= kWgiBtnDpadRight;
+  if (g.wButtons & kWgiXiStart) b |= kWgiBtnMenu;
+  if (g.wButtons & kWgiXiBack) b |= kWgiBtnView;
+  if (g.wButtons & kWgiXiLeftThumb) b |= kWgiBtnLeftThumb;
+  if (g.wButtons & kWgiXiRightThumb) b |= kWgiBtnRightThumb;
+  if (g.wButtons & kWgiXiLeftShoulder) b |= kWgiBtnLeftShoulder;
+  if (g.wButtons & kWgiXiRightShoulder) b |= kWgiBtnRightShoulder;
+  if (g.wButtons & kWgiXiA) b |= kWgiBtnA;
+  if (g.wButtons & kWgiXiB) b |= kWgiBtnB;
+  if (g.wButtons & kWgiXiX) b |= kWgiBtnX;
+  if (g.wButtons & kWgiXiY) b |= kWgiBtnY;
+  out->Timestamp = WgiNowUs();
+  out->Buttons = b;
+  out->LeftTrigger = g.bLeftTrigger / 255.0;
+  out->RightTrigger = g.bRightTrigger / 255.0;
+  out->LeftThumbstickX = g.sThumbLX / 32767.0;
+  out->LeftThumbstickY = g.sThumbLY / 32767.0;
+  out->RightThumbstickX = g.sThumbRX / 32767.0;
+  out->RightThumbstickY = g.sThumbRY / 32767.0;
+}
+
+/**
+ * @brief Serve GetIids from a fixed GUID list through CoTaskMemAlloc'd memory.
+ * @param list The implemented IIDs (caller keeps ownership).
+ * @param count Number of entries in list.
+ * @param[out] iidCount Receives the count.
+ * @param[out] iids Receives the allocated array (caller frees CoTaskMemFree).
+ * @return S_OK, or E_POINTER / E_OUTOFMEMORY on failure.
+ */
+static HRESULT WgiServeIids(const GUID* list, ULONG count, ULONG* iidCount, IID** iids) {
+  if (iidCount == nullptr || iids == nullptr)
+    return E_POINTER;
+  IID* out = (IID*)CoTaskMemAlloc(sizeof(IID) * count);
+  if (out == nullptr && count > 0) {
+    *iidCount = 0;
+    *iids = nullptr;
+    return E_OUTOFMEMORY;
+  }
+  for (ULONG i = 0; i < count; ++i)
+    out[i] = list[i];
+  *iidCount = count;
+  *iids = out;
+  return S_OK;
+}
+
+/**
+ * @brief Serve GetRuntimeClassName from a literal class name.
+ * @param name The runtime class name.
+ * @param[out] className Receives the new HSTRING (caller deletes it).
+ * @return S_OK, E_POINTER, or E_NOTIMPL when combase string helpers are
+ * unavailable.
+ */
+static HRESULT WgiServeClassName(const wchar_t* name, WgiHstring* className) {
+  if (className == nullptr)
+    return E_POINTER;
+  if (g_wgiCreateString == nullptr) {
+    *className = nullptr;
+    return E_NOTIMPL;
+  }
+  return g_wgiCreateString(name, (UINT32)wcslen(name), className);
+}
+
+/* The fake pad and the fake statics are process-lifetime singletons: games
+   store WinRT object identity (QI to IUnknown) and compare it, so the pad
+   handed out at every enumeration must be the very same object for the whole
+   session. Their Release therefore keeps the object alive (refcount floor of
+   one); the per-call list views and iterators are ordinary heap objects. */
+
+/**
+ * @brief The fake connected gamepad served through Windows.Gaming.Input.
+ *
+ * Implements IGamepad, IGamepad2, IGameController and
+ * IGameControllerBatteryInfo on one object so every QI path a title takes
+   lands on the same pad identity. State comes from WgiSourceState (the UDP
+ * rewrite snapshots), rumble writes are consumed and stored, and the
+   headset/user/battery plumbing answers the empty-but-valid values a wired
+   360 pad would.
+ */
+class WgiFakeGamepad final : public WgiIGamepad,
+                             public WgiIGamepad2,
+                             public WgiIGameController,
+                             public WgiIGameControllerBatteryInfo {
+ public:
+  WgiFakeGamepad() : refs_(1) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr)
+      return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable) ||
+        IsEqualGUID(riid, kWgiIidIGamepad)) {
+      obj = static_cast<WgiIGamepad*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIGamepad2)) {
+      obj = static_cast<WgiIGamepad2*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIGameController)) {
+      obj = static_cast<WgiIGameController*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIGameControllerBatteryInfo)) {
+      obj = static_cast<WgiIGameControllerBatteryInfo*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return (ULONG)InterlockedIncrement(&refs_);
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    /* Immortal singleton: identity must stay stable for the whole session. */
+    if (refs_ > 0)
+      InterlockedDecrement(&refs_);
+    return (ULONG)refs_;
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    static const GUID kIids[] = {kWgiIidIGamepad, kWgiIidIGamepad2, kWgiIidIGameController,
+                                 kWgiIidIGameControllerBatteryInfo};
+    return WgiServeIids(kIids, 4, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(L"Windows.Gaming.Input.Gamepad", className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr)
+      return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_Vibration(WgiGamepadVibration* value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    *value = g_wgiVibration;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE put_Vibration(WgiGamepadVibration value) override {
+    InterlockedIncrement64(&g_wgiVibCalls);
+    g_wgiVibration = value;
+    if (InterlockedCompareExchange64(&g_wgiVibLogged, 1, 0) == 0)
+      Dlog("wgi: put_Vibration consumed (lm=%.3f rm=%.3f lt=%.3f rt=%.3f)",
+           value.LeftMotor, value.RightMotor, value.LeftTrigger, value.RightTrigger);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetCurrentReading(WgiGamepadReading* value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    InterlockedIncrement64(&g_wgiReadCalls);
+    bool fresh = false;
+    const XINPUT_GAMEPAD g = WgiSourceState(&fresh);
+    WgiFillReading(g, value);
+    if (fresh)
+      InterlockedIncrement64(&g_wgiServedFresh);
+    if (InterlockedCompareExchange64(&g_wgiReadLogged, 1, 0) == 0)
+      Dlog("wgi: GetCurrentReading served (fresh=%d btn=%08lx)",
+           fresh ? 1 : 0, (unsigned long)value->Buttons);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetButtonLabel(std::int32_t button, std::int32_t* value) override {
+    (void)button;
+    if (value == nullptr)
+      return E_POINTER;
+    *value = 0; /* GameControllerButtonLabel::None */
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE add_HeadsetConnected(void* value, WgiEventToken* token) override {
+    (void)value;
+    if (token == nullptr)
+      return E_POINTER;
+    token->value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_HeadsetConnected(WgiEventToken token) override {
+    (void)token;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE add_HeadsetDisconnected(void* value, WgiEventToken* token) override {
+    (void)value;
+    if (token == nullptr)
+      return E_POINTER;
+    token->value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_HeadsetDisconnected(WgiEventToken token) override {
+    (void)token;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE add_UserChanged(void* value, WgiEventToken* token) override {
+    (void)value;
+    if (token == nullptr)
+      return E_POINTER;
+    token->value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_UserChanged(WgiEventToken token) override {
+    (void)token;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_Headset(void** value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    *value = nullptr; /* wired pad, no headset attached */
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_IsWireless(unsigned char* value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    *value = 0; /* wired */
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_User(void** value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    *value = nullptr; /* no user pairing on a wired 360 pad */
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE TryGetBatteryReport(void** value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    *value = nullptr; /* wired: no battery to report */
+    return S_OK;
+  }
+
+ private:
+  volatile LONG refs_; ///< Object reference count (floor of one: immortal).
+};
+
+/** The single fake pad object (immortal; created by WgiFakeInstall). */
+static WgiFakeGamepad* g_wgiFakePadObj = nullptr;
+/** The pad's IGamepad subobject pointer, for identity compares and handouts. */
+static WgiIGamepad* g_wgiFakePadI = nullptr;
+
+/**
+ * @brief The fake pad's IGamepad interface pointer.
+ * @return The subobject pointer handed to the game, or nullptr before
+ * install.
+ */
+static WgiIGamepad* WgiFakePadInterface(void) {
+  return g_wgiFakePadI;
+}
+
+/**
+ * @brief Hand the fake pad out through an out parameter (AddRef + assign).
+ * @param[out] out Receives the pad's IGamepad pointer.
+ */
+static void WgiAcquireFakePad(WgiIGamepad** out) {
+  if (out == nullptr || g_wgiFakePadObj == nullptr)
+    return;
+  g_wgiFakePadObj->AddRef();
+  *out = g_wgiFakePadI;
+}
+
+/**
+ * @brief AddRef the captured OS statics for a pass-through call.
+ * @return The OS statics (caller releases), or nullptr when none was
+ * captured.
+ */
+
+/**
+ * @brief Whether an IGameController interface pointer is the fake pad.
+ * @param controller The controller to test (any of its WinRT interfaces).
+ * @return True when the object is the fake pad.
+ */
+static bool WgiIsFakePadController(void* controller) {
+  if (controller == nullptr || g_wgiFakePadObj == nullptr)
+    return false;
+  WgiIGamepad* probe = nullptr;
+  WgiIInspectable* insp = (WgiIInspectable*)controller;
+  if (FAILED(insp->QueryInterface(kWgiIidIGamepad, (void**)&probe)) || probe == nullptr)
+    return false;
+  const bool ours = (probe == g_wgiFakePadI);
+  probe->Release();
+  return ours;
+}
+
+/**
+ * @brief The fake IIterator over the one-element pad list.
+ *
+ * Also answers IIterable<Gamepad> (WinRT iterators conceptually re-enter
+ * iteration) so a QI on the cursor keeps working.
+ */
+class WgiFakeVectorIterator final : public WgiIIteratorGamepad,
+                                    public WgiIIterableGamepad {
+ public:
+  WgiFakeVectorIterator() : refs_(1), pos_(0) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr)
+      return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable) ||
+        IsEqualGUID(riid, kWgiIidIteratorGamepad)) {
+      obj = static_cast<WgiIIteratorGamepad*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIterableGamepad)) {
+      obj = static_cast<WgiIIterableGamepad*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return (ULONG)InterlockedIncrement(&refs_);
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG r = InterlockedDecrement(&refs_);
+    if (r == 0)
+      delete this;
+    return (ULONG)(r > 0 ? r : 0);
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    static const GUID kIids[] = {kWgiIidIteratorGamepad, kWgiIidIterableGamepad};
+    return WgiServeIids(kIids, 2, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(
+        L"Windows.Foundation.Collections.IIterator`1<Windows.Gaming.Input.Gamepad>",
+        className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr)
+      return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_Current(WgiIGamepad** result) override {
+    if (result == nullptr)
+      return E_POINTER;
+    if (pos_ >= 1)
+      return E_BOUNDS;
+    WgiAcquireFakePad(result);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_HasCurrent(unsigned char* result) override {
+    if (result == nullptr)
+      return E_POINTER;
+    *result = (pos_ < 1) ? 1 : 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE MoveNext(unsigned char* result) override {
+    if (result == nullptr)
+      return E_POINTER;
+    pos_ += (pos_ < 1) ? 1 : 0;
+    *result = (pos_ < 1) ? 1 : 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t itemsLength, WgiIGamepad** items,
+                                    std::uint32_t* result) override {
+    if (result == nullptr || (itemsLength > 0 && items == nullptr))
+      return E_POINTER;
+    std::uint32_t copied = 0;
+    if (items != nullptr) {
+      for (; copied < itemsLength && pos_ < 1; ++copied, ++pos_)
+        WgiAcquireFakePad(&items[copied]);
+    }
+    *result = copied;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE First(WgiIIteratorGamepad** result) override {
+    if (result == nullptr)
+      return E_POINTER;
+    AddRef();
+    *result = static_cast<WgiIIteratorGamepad*>(this);
+    return S_OK;
+  }
+
+ private:
+  volatile LONG refs_;      ///< Object reference count.
+  std::uint32_t pos_;       ///< Next element index (0 = the one fake pad).
+};
+
+/**
+ * @brief The fake IVectorView over the one fake pad.
+ *
+ * Also answers IIterable<Gamepad> because C++/WinRT's range-for enters the
+ * view through QI for IIterable before calling First().
+ */
+class WgiFakeVectorView final : public WgiIVectorViewGamepad, public WgiIIterableGamepad {
+ public:
+  WgiFakeVectorView() : refs_(1) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr)
+      return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable) ||
+        IsEqualGUID(riid, kWgiIidVectorViewGamepad)) {
+      obj = static_cast<WgiIVectorViewGamepad*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIterableGamepad)) {
+      obj = static_cast<WgiIIterableGamepad*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return (ULONG)InterlockedIncrement(&refs_);
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG r = InterlockedDecrement(&refs_);
+    if (r == 0)
+      delete this;
+    return (ULONG)(r > 0 ? r : 0);
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    static const GUID kIids[] = {kWgiIidVectorViewGamepad, kWgiIidIterableGamepad};
+    return WgiServeIids(kIids, 2, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(
+        L"Windows.Foundation.Collections.IVectorView`1<Windows.Gaming.Input.Gamepad>",
+        className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr)
+      return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetAt(std::uint32_t index, WgiIGamepad** result) override {
+    if (result == nullptr)
+      return E_POINTER;
+    if (index != 0)
+      return E_BOUNDS;
+    WgiAcquireFakePad(result);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_Size(std::uint32_t* result) override {
+    if (result == nullptr)
+      return E_POINTER;
+    *result = 1;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE IndexOf(WgiIGamepad* value, std::uint32_t* index,
+                                   unsigned char* result) override {
+    if (index == nullptr || result == nullptr)
+      return E_POINTER;
+    *index = 0;
+    *result = (value == WgiFakePadInterface()) ? 1 : 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t startIndex, std::uint32_t itemsLength,
+                                    WgiIGamepad** items, std::uint32_t* result) override {
+    if (result == nullptr || (itemsLength > 0 && items == nullptr))
+      return E_POINTER;
+    std::uint32_t copied = 0;
+    if (startIndex == 0 && itemsLength > 0 && items != nullptr) {
+      WgiAcquireFakePad(&items[0]);
+      copied = 1;
+    }
+    *result = copied;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE First(WgiIIteratorGamepad** result) override {
+    if (result == nullptr)
+      return E_POINTER;
+    *result = new WgiFakeVectorIterator();
+    return S_OK;
+  }
+
+ private:
+  volatile LONG refs_; ///< Object reference count.
+};
+
+/* ------------------------------------------------------------------ */
+/* RawGameController fake (UE5 discovery + reading path)               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief A generic empty IVectorView<T> for out-params that must be a valid
+ *        collection but hold no elements (ForceFeedbackMotors,
+ *        SimpleHapticsControllers). Per-call object (ordinary refcount).
+ */
+class WgiFakeEmptyVectorView final : public WgiIVectorViewEmpty {
+ public:
+  WgiFakeEmptyVectorView() : refs_(1) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr)
+      return E_POINTER;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable)) {
+      AddRef();
+      *ppvObject = static_cast<WgiIVectorViewEmpty*>(this);
+      return S_OK;
+    }
+    *ppvObject = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs_); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG r = InterlockedDecrement(&refs_);
+    if (r == 0) delete this;
+    return (ULONG)(r > 0 ? r : 0);
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    return WgiServeIids(nullptr, 0, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(L"Windows.Foundation.Collections.IVectorView`1", className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr) return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetAt(std::uint32_t /*index*/, void** result) override {
+    if (result == nullptr) return E_POINTER;
+    *result = nullptr;
+    return E_BOUNDS;
+  }
+  HRESULT STDMETHODCALLTYPE get_Size(std::uint32_t* result) override {
+    if (result == nullptr) return E_POINTER;
+    *result = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE IndexOf(void* /*value*/, std::uint32_t* index,
+                                    unsigned char* result) override {
+    if (index == nullptr || result == nullptr) return E_POINTER;
+    *index = 0;
+    *result = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t /*startIndex*/, std::uint32_t /*itemsLength*/,
+                                    void** /*items*/, std::uint32_t* result) override {
+    if (result == nullptr) return E_POINTER;
+    *result = 0;
+    return S_OK;
+  }
+
+ private:
+  volatile LONG refs_;
+};
+
+/** Xbox 360 button index -> GameControllerButtonLabel (SDK enum order). */
+static const std::int32_t kWgiRawButtonLabels[14] = {
+    1,  /* A */
+    2,  /* B */
+    3,  /* X */
+    4,  /* Y */
+    9,  /* LeftShoulder */
+    10, /* RightShoulder */
+    16, /* View (Back) */
+    15, /* Menu (Start) */
+    13, /* LeftThumbstick */
+    14, /* RightThumbstick */
+    5,  /* DPadUp */
+    6,  /* DPadDown */
+    7,  /* DPadLeft */
+    8   /* DPadRight */
+};
+
+/**
+ * @brief The fake connected RawGameController served through Windows.Gaming.Input.
+ *
+ * Presents a wired Xbox 360 pad (VID 045E / PID 028E): 14 buttons, 6 axes,
+ * 0 switches. GetCurrentReading is fed from the same WgiSourceState (UDP
+ * snapshot) as the Gamepad fake, so both surfaces stay in sync. Also
+ * implements IGameController / IGameControllerBatteryInfo for the
+ * headset/user/battery plumbing UE5 probes.
+ */
+class WgiFakeRawGamepad final : public WgiIRawGameController,
+                               public WgiIRawGameController2,
+                               public WgiIGameController,
+                               public WgiIGameControllerBatteryInfo {
+ public:
+  WgiFakeRawGamepad() : refs_(1) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr) return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable) ||
+        IsEqualGUID(riid, kWgiIidIRawGameController)) {
+      obj = static_cast<WgiIRawGameController*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIRawGameController2)) {
+      obj = static_cast<WgiIRawGameController2*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIGameController)) {
+      obj = static_cast<WgiIGameController*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIGameControllerBatteryInfo)) {
+      obj = static_cast<WgiIGameControllerBatteryInfo*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs_); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    if (refs_ > 0) InterlockedDecrement(&refs_);
+    return (ULONG)refs_;
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    static const GUID kIids[] = {kWgiIidIRawGameController, kWgiIidIRawGameController2,
+                                 kWgiIidIGameController, kWgiIidIGameControllerBatteryInfo};
+    return WgiServeIids(kIids, 4, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(L"Windows.Gaming.Input.RawGameController", className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr) return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_AxisCount(std::int32_t* value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = 6;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_ButtonCount(std::int32_t* value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = 14;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_ForceFeedbackMotors(void** value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = new WgiFakeEmptyVectorView();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_HardwareProductId(std::uint16_t* value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = 0x028E;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_HardwareVendorId(std::uint16_t* value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = 0x045E;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_SwitchCount(std::int32_t* value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetButtonLabel(std::int32_t buttonIndex,
+                                           std::int32_t* value) override {
+    if (value == nullptr) return E_POINTER;
+    if (buttonIndex < 0 || buttonIndex >= 14) {
+      *value = 0;
+      return S_OK;
+    }
+    *value = kWgiRawButtonLabels[buttonIndex];
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetCurrentReading(std::uint32_t buttonArrayLength,
+                                              unsigned char* buttonArray,
+                                              std::uint32_t /*switchArrayLength*/,
+                                              std::int32_t* /*switchArray*/,
+                                              std::uint32_t axisArrayLength,
+                                              double* axisArray,
+                                              std::uint64_t* timestamp) override {
+    InterlockedIncrement64(&g_wgiRawReadCalls);
+    bool fresh = false;
+    const XINPUT_GAMEPAD g = WgiSourceState(&fresh);
+    if (fresh) InterlockedIncrement64(&g_wgiRawServedFresh);
+    if (buttonArray != nullptr) {
+      const std::uint32_t n = buttonArrayLength < 14 ? buttonArrayLength : 14;
+      for (std::uint32_t i = 0; i < n; ++i) buttonArray[i] = 0;
+      if (n > 0) {
+        buttonArray[0] = (g.wButtons & kWgiXiA) ? 1 : 0;
+        buttonArray[1] = (g.wButtons & kWgiXiB) ? 1 : 0;
+        buttonArray[2] = (g.wButtons & kWgiXiX) ? 1 : 0;
+        buttonArray[3] = (g.wButtons & kWgiXiY) ? 1 : 0;
+        buttonArray[4] = (g.wButtons & kWgiXiLeftShoulder) ? 1 : 0;
+        buttonArray[5] = (g.wButtons & kWgiXiRightShoulder) ? 1 : 0;
+        buttonArray[6] = (g.wButtons & kWgiXiBack) ? 1 : 0;
+        buttonArray[7] = (g.wButtons & kWgiXiStart) ? 1 : 0;
+        buttonArray[8] = (g.wButtons & kWgiXiLeftThumb) ? 1 : 0;
+        buttonArray[9] = (g.wButtons & kWgiXiRightThumb) ? 1 : 0;
+        buttonArray[10] = (g.wButtons & kWgiXiDpadUp) ? 1 : 0;
+        buttonArray[11] = (g.wButtons & kWgiXiDpadDown) ? 1 : 0;
+        buttonArray[12] = (g.wButtons & kWgiXiDpadLeft) ? 1 : 0;
+        buttonArray[13] = (g.wButtons & kWgiXiDpadRight) ? 1 : 0;
+      }
+    }
+    if (axisArray != nullptr) {
+      const std::uint32_t n = axisArrayLength < 6 ? axisArrayLength : 6;
+      for (std::uint32_t i = 0; i < n; ++i) axisArray[i] = 0.0;
+      if (n > 0) axisArray[0] = g.sThumbLX / 32767.0;
+      if (n > 1) axisArray[1] = g.sThumbLY / 32767.0;
+      if (n > 2) axisArray[2] = g.sThumbRX / 32767.0;
+      if (n > 3) axisArray[3] = g.sThumbRY / 32767.0;
+      if (n > 4) axisArray[4] = g.bLeftTrigger / 255.0;
+      if (n > 5) axisArray[5] = g.bRightTrigger / 255.0;
+    }
+    if (timestamp != nullptr) *timestamp = WgiNowUs();
+    if (InterlockedCompareExchange64(&g_wgiRawReadLogged, 1, 0) == 0)
+      Dlog("wgi: RawGameController GetCurrentReading served (fresh=%d btn=%04x)",
+           fresh ? 1 : 0, (unsigned)g.wButtons);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetSwitchKind(std::int32_t /*switchIndex*/,
+                                          std::int32_t* value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = 0;
+    return E_BOUNDS;
+  }
+  HRESULT STDMETHODCALLTYPE get_SimpleHapticsControllers(void** value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = new WgiFakeEmptyVectorView();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_NonRoamableId(WgiHstring* value) override {
+    return WgiServeClassName(L"0", value);
+  }
+  HRESULT STDMETHODCALLTYPE get_DisplayName(WgiHstring* value) override {
+    return WgiServeClassName(L"Controller", value);
+  }
+  HRESULT STDMETHODCALLTYPE add_HeadsetConnected(void* /*value*/, WgiEventToken* token) override {
+    if (token == nullptr) return E_POINTER;
+    token->value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_HeadsetConnected(WgiEventToken /*token*/) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE add_HeadsetDisconnected(void* /*value*/, WgiEventToken* token) override {
+    if (token == nullptr) return E_POINTER;
+    token->value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_HeadsetDisconnected(WgiEventToken /*token*/) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE add_UserChanged(void* /*value*/, WgiEventToken* token) override {
+    if (token == nullptr) return E_POINTER;
+    token->value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_UserChanged(WgiEventToken /*token*/) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE get_Headset(void** value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = nullptr;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_IsWireless(unsigned char* value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_User(void** value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = nullptr;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE TryGetBatteryReport(void** value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = nullptr;
+    return S_OK;
+  }
+
+ private:
+  volatile LONG refs_;
+};
+
+/** The single fake RawGameController object (immortal; created by WgiFakeInstall). */
+static WgiFakeRawGamepad* g_wgiFakeRawPadObj = nullptr;
+
+/**
+ * @brief Hand the fake raw controller out through an out parameter (AddRef + assign).
+ * @param[out] out Receives the controller's IRawGameController pointer.
+ */
+static void WgiAcquireFakeRawPad(WgiIRawGameController** out) {
+  if (out == nullptr || g_wgiFakeRawPadObj == nullptr) return;
+  g_wgiFakeRawPadObj->AddRef();
+  *out = g_wgiFakeRawPadI;
+}
+
+/**
+ * @brief The fake raw controller's IRawGameController interface pointer.
+ * @return The subobject pointer handed to the game, or nullptr before install.
+ */
+static WgiIRawGameController* WgiFakeRawPadInterface(void) { return g_wgiFakeRawPadI; }
+
+/**
+ * @brief Whether an IGameController interface pointer is the fake raw controller.
+ * @param controller The controller to test (any of its WinRT interfaces).
+ * @return True when the object is the fake raw controller.
+ */
+static bool WgiIsFakeRawController(void* controller) {
+  if (controller == nullptr || g_wgiFakeRawPadObj == nullptr) return false;
+  WgiIRawGameController* probe = nullptr;
+  WgiIInspectable* insp = (WgiIInspectable*)controller;
+  if (FAILED(insp->QueryInterface(kWgiIidIRawGameController, (void**)&probe)) || probe == nullptr)
+    return false;
+  const bool ours = (probe == g_wgiFakeRawPadI);
+  probe->Release();
+  return ours;
+}
+
+/**
+ * @brief AddRef the captured OS RawGameController statics for a pass-through call.
+ * @return The OS statics (caller releases), or nullptr when none was captured.
+ */
+static WgiIRawGameControllerStatics* WgiRawRealStaticsAcquire(void) {
+  if (g_wgiLockInit != 1) return nullptr;
+  EnterCriticalSection(&g_wgiLock);
+  WgiIRawGameControllerStatics* s = g_wgiRealRawStatics;
+  if (s != nullptr) s->AddRef();
+  LeaveCriticalSection(&g_wgiLock);
+  return s;
+}
+
+/**
+ * @brief AddRef the captured OS GamepadStatics2 for a FromGameController pass-through.
+ *
+ * The real IGamepadStatics2 (WinRT extension of IGamepadStatics) owns the
+ * FromGameController mapping. When a real controller is detected in the
+ * pass-through path we delegate to it so the game sees the real device.
+ * @return The OS statics2 (caller releases), or nullptr when none was captured.
+ */
+static WgiIGamepadStatics2* WgiRealStatics2Acquire(void) {
+  if (g_wgiLockInit != 1) return nullptr;
+  EnterCriticalSection(&g_wgiLock);
+  WgiIGamepadStatics2* s = g_wgiRealStatics2;
+  if (s != nullptr) s->AddRef();
+  LeaveCriticalSection(&g_wgiLock);
+  return s;
+}
+
+/**
+ * @brief Whether an IID is one of the parameterized collection IIDs gleaned
+ *        from the real OS RawGameControllers view (IVectorView/IIterable).
+ *
+ * The fake view answers IIterable through these IIDs so C++/WinRT's range-for
+ * (which QIs the view to IIterable before calling First()) succeeds.
+ * @param riid The requested IID.
+ * @return True when the IID is a known RawGameController collection IID.
+ */
+static bool WgiIsRawCollectionIid(REFIID riid) {
+  if (g_wgiRawViewIidCount <= 0) return false;
+  for (int i = 0; i < g_wgiRawViewIidCount; ++i)
+    if (IsEqualGUID(riid, g_wgiRawViewIids[i])) return true;
+  return false;
+}
+
+/**
+ * @brief The fake IIterator over the one-element raw controller list.
+ */
+class WgiFakeRawVectorIterator final : public WgiIIteratorRawGameController,
+                                      public WgiIIterableRawGameController {
+ public:
+  WgiFakeRawVectorIterator() : refs_(1), pos_(0) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr) return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable)) {
+      obj = static_cast<WgiIIteratorRawGameController*>(this);
+    } else if (WgiIsRawCollectionIid(riid)) {
+      obj = static_cast<WgiIIterableRawGameController*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs_); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG r = InterlockedDecrement(&refs_);
+    if (r == 0) delete this;
+    return (ULONG)(r > 0 ? r : 0);
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    return WgiServeIids(nullptr, 0, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(
+        L"Windows.Foundation.Collections.IIterator`1<Windows.Gaming.Input.RawGameController>",
+        className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr) return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_Current(WgiIRawGameController** result) override {
+    if (result == nullptr) return E_POINTER;
+    if (pos_ >= 1) return E_BOUNDS;
+    WgiAcquireFakeRawPad(result);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_HasCurrent(unsigned char* result) override {
+    if (result == nullptr) return E_POINTER;
+    *result = (pos_ < 1) ? 1 : 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE MoveNext(unsigned char* result) override {
+    if (result == nullptr) return E_POINTER;
+    pos_ += (pos_ < 1) ? 1 : 0;
+    *result = (pos_ < 1) ? 1 : 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t itemsLength, WgiIRawGameController** items,
+                                    std::uint32_t* result) override {
+    if (result == nullptr || (itemsLength > 0 && items == nullptr)) return E_POINTER;
+    std::uint32_t copied = 0;
+    if (items != nullptr) {
+      for (; copied < itemsLength && pos_ < 1; ++copied, ++pos_)
+        WgiAcquireFakeRawPad(&items[copied]);
+    }
+    *result = copied;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE First(WgiIIteratorRawGameController** result) override {
+    if (result == nullptr) return E_POINTER;
+    AddRef();
+    *result = static_cast<WgiIIteratorRawGameController*>(this);
+    return S_OK;
+  }
+
+ private:
+  volatile LONG refs_;
+  std::uint32_t pos_;
+};
+
+/**
+ * @brief The fake IVectorView over the one fake raw controller.
+ *
+ * Also answers IIterable<RawGameController> (through the IIDs gleaned from the
+ * real OS view) so C++/WinRT's range-for can QI to IIterable and call First().
+ */
+class WgiFakeRawVectorView final : public WgiIVectorViewRawGameController,
+                                  public WgiIIterableRawGameController {
+ public:
+  WgiFakeRawVectorView() : refs_(1) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr) return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable)) {
+      obj = static_cast<WgiIVectorViewRawGameController*>(this);
+    } else if (WgiIsRawCollectionIid(riid)) {
+      obj = static_cast<WgiIIterableRawGameController*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs_); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG r = InterlockedDecrement(&refs_);
+    if (r == 0) delete this;
+    return (ULONG)(r > 0 ? r : 0);
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    return WgiServeIids(nullptr, 0, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(
+        L"Windows.Foundation.Collections.IVectorView`1<Windows.Gaming.Input.RawGameController>",
+        className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr) return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetAt(std::uint32_t index, WgiIRawGameController** result) override {
+    if (result == nullptr) return E_POINTER;
+    if (index != 0) return E_BOUNDS;
+    WgiAcquireFakeRawPad(result);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_Size(std::uint32_t* result) override {
+    if (result == nullptr) return E_POINTER;
+    *result = 1;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE IndexOf(WgiIRawGameController* value, std::uint32_t* index,
+                                    unsigned char* result) override {
+    if (index == nullptr || result == nullptr) return E_POINTER;
+    *index = 0;
+    *result = (value == WgiFakeRawPadInterface()) ? 1 : 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetMany(std::uint32_t startIndex, std::uint32_t itemsLength,
+                                    WgiIRawGameController** items,
+                                    std::uint32_t* result) override {
+    if (result == nullptr || (itemsLength > 0 && items == nullptr)) return E_POINTER;
+    std::uint32_t copied = 0;
+    if (startIndex == 0 && itemsLength > 0 && items != nullptr) {
+      WgiAcquireFakeRawPad(&items[0]);
+      copied = 1;
+    }
+    *result = copied;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE First(WgiIIteratorRawGameController** result) override {
+    if (result == nullptr) return E_POINTER;
+    *result = new WgiFakeRawVectorIterator();
+    return S_OK;
+  }
+
+ private:
+  volatile LONG refs_;
+};
+
+/**
+ * @brief The fake RawGameController activation factory / statics.
+ *
+ * Serves IActivationFactory and IRawGameControllerStatics. The Added handler is
+ * fired once with the fake pad on subscription (UE5 discovers controllers
+ * through this event). get_RawGameControllers passes the real system view
+ * through when the OS has a controller, otherwise presents the fake pad.
+ */
+class WgiFakeRawStatics final : public WgiIActivationFactory,
+                               public WgiIRawGameControllerStatics {
+ public:
+  WgiFakeRawStatics() : refs_(1) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr) return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable) ||
+        IsEqualGUID(riid, kWgiIidActivationFactory)) {
+      obj = static_cast<WgiIActivationFactory*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIRawGameControllerStatics)) {
+      obj = static_cast<WgiIRawGameControllerStatics*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs_); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    if (refs_ > 0) InterlockedDecrement(&refs_);
+    return (ULONG)refs_;
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    static const GUID kIids[] = {kWgiIidActivationFactory, kWgiIidIRawGameControllerStatics};
+    return WgiServeIids(kIids, 2, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(L"Windows.Gaming.Input.RawGameController", className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr) return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE ActivateInstance(WgiIInspectable** instance) override {
+    if (instance == nullptr) return E_POINTER;
+    *instance = nullptr;
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE add_RawGameControllerAdded(
+      WgiIEventHandlerRawGameController* value, WgiEventToken* token) override {
+    if (value == nullptr || token == nullptr) return E_POINTER;
+    InterlockedIncrement64(&g_wgiRawAddedSubs);
+    int slot = -1;
+    if (g_wgiLockInit == 1) {
+      EnterCriticalSection(&g_wgiLock);
+      for (int i = 0; i < WGI_MAX_RAW_HANDLERS; ++i) {
+        if (g_wgiRawAddedHandlers[i] == nullptr) {
+          slot = i;
+          break;
+        }
+      }
+      if (slot >= 0) {
+        value->AddRef();
+        g_wgiRawAddedHandlers[slot] = value;
+      }
+      LeaveCriticalSection(&g_wgiLock);
+    }
+    token->value = slot + 1;
+    if (InterlockedCompareExchange64(&g_wgiRawAddedLogged, 1, 0) == 0)
+      Dlog("wgi: RawGameControllerAdded subscribed (slot=%d)", slot);
+    /* Fire the Added event once with the fake pad: UE5 creates its input device
+       in this callback. Real WGI never raises Added for already-connected pads,
+       but the fake pad is materialized on demand, so the subscription is the
+       only discovery signal. Done outside the lock to avoid re-entry deadlock. */
+    if (slot >= 0 && g_wgiFakeRawPadI != nullptr &&
+        InterlockedCompareExchange(&g_wgiRawAddedFired, 1, 0) == 0) {
+      g_wgiFakeRawPadObj->AddRef();
+      value->Invoke(nullptr, g_wgiFakeRawPadI);
+      Dlog("wgi: RawGameControllerAdded fired with the fake pad");
+    }
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_RawGameControllerAdded(WgiEventToken token) override {
+    if (g_wgiLockInit != 1 || token.value <= 0 || token.value > WGI_MAX_RAW_HANDLERS)
+      return S_OK;
+    EnterCriticalSection(&g_wgiLock);
+    WgiIEventHandlerRawGameController* h = g_wgiRawAddedHandlers[token.value - 1];
+    g_wgiRawAddedHandlers[token.value - 1] = nullptr;
+    LeaveCriticalSection(&g_wgiLock);
+    if (h != nullptr) h->Release();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE add_RawGameControllerRemoved(
+      WgiIEventHandlerRawGameController* value, WgiEventToken* token) override {
+    if (value == nullptr || token == nullptr) return E_POINTER;
+    int slot = -1;
+    if (g_wgiLockInit == 1) {
+      EnterCriticalSection(&g_wgiLock);
+      for (int i = 0; i < WGI_MAX_RAW_HANDLERS; ++i) {
+        if (g_wgiRawRemovedHandlers[i] == nullptr) {
+          slot = i;
+          break;
+        }
+      }
+      if (slot >= 0) {
+        value->AddRef();
+        g_wgiRawRemovedHandlers[slot] = value;
+      }
+      LeaveCriticalSection(&g_wgiLock);
+    }
+    token->value = slot + 1;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_RawGameControllerRemoved(WgiEventToken token) override {
+    if (g_wgiLockInit != 1 || token.value <= 0 || token.value > WGI_MAX_RAW_HANDLERS)
+      return S_OK;
+    EnterCriticalSection(&g_wgiLock);
+    WgiIEventHandlerRawGameController* h = g_wgiRawRemovedHandlers[token.value - 1];
+    g_wgiRawRemovedHandlers[token.value - 1] = nullptr;
+    LeaveCriticalSection(&g_wgiLock);
+    if (h != nullptr) h->Release();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_RawGameControllers(
+      WgiIVectorViewRawGameController** value) override {
+    if (value == nullptr) return E_POINTER;
+    InterlockedIncrement64(&g_wgiRawListCalls);
+    /* Real controllers always win: pass the system view through untouched. */
+    WgiIRawGameControllerStatics* real = WgiRawRealStaticsAcquire();
+    if (real != nullptr) {
+      WgiIVectorViewRawGameController* view = nullptr;
+      const HRESULT hr = real->get_RawGameControllers(&view);
+      real->Release();
+      if (SUCCEEDED(hr) && view != nullptr) {
+        std::uint32_t size = 0;
+        const bool sized = SUCCEEDED(view->get_Size(&size));
+        if (sized && size > 0) {
+          if (InterlockedCompareExchange64(&g_wgiRawListLogged, 1, 0) == 0)
+            Dlog("wgi: get_RawGameControllers passed the REAL system view (size=%lu)",
+                 (unsigned long)size);
+          *value = view;
+          return S_OK;
+        }
+        view->Release();
+      }
+    }
+    if (InterlockedCompareExchange64(&g_wgiRawListLogged, 1, 0) == 0)
+      Dlog("wgi: get_RawGameControllers serving the fake raw controller");
+    *value = new WgiFakeRawVectorView();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE FromGameController(void* gameController,
+                                               WgiIRawGameController** value) override {
+    if (value == nullptr) return E_POINTER;
+    *value = nullptr;
+    if (gameController == nullptr) return E_POINTER;
+    if (WgiIsFakeRawController(gameController)) {
+      WgiAcquireFakeRawPad(value);
+      return S_OK;
+    }
+    WgiIRawGameControllerStatics* real = WgiRawRealStaticsAcquire();
+    if (real != nullptr) {
+      const HRESULT hr = real->FromGameController(gameController, value);
+      real->Release();
+      return hr;
+    }
+    return E_INVALIDARG;
+  }
+
+ private:
+  volatile LONG refs_;
+};
+
+/** The single fake RawGameController statics object (immortal). */
+static WgiFakeRawStatics* g_wgiFakeRawStaticsObj = nullptr;
+
+/**
+ * @brief The fake Gamepad activation factory / statics.
+ *
+ * Serves IActivationFactory, IGamepadStatics and IGamepadStatics2 on one
+ * object. get_Gamepads passes the real system view through whenever the OS
+ * has a controller, and otherwise presents the fake pad; FromGameController
+ * resolves the fake pad by identity and forwards real controllers to the OS
+ * statics. GamepadAdded / GamepadRemoved subscriptions are stored but never
+ * fired: real WGI does not raise Added for pads that are already
+ * enumerated, and the fake pad is enumerable from the first call.
+ */
+class WgiFakeStatics final : public WgiIActivationFactory,
+                             public WgiIGamepadStatics,
+                             public WgiIGamepadStatics2 {
+ public:
+  WgiFakeStatics() : refs_(1) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+    if (ppvObject == nullptr)
+      return E_POINTER;
+    void* obj = nullptr;
+    if (IsEqualGUID(riid, kWgiIidUnknown) || IsEqualGUID(riid, kWgiIidInspectable) ||
+        IsEqualGUID(riid, kWgiIidActivationFactory)) {
+      obj = static_cast<WgiIActivationFactory*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIGamepadStatics)) {
+      obj = static_cast<WgiIGamepadStatics*>(this);
+    } else if (IsEqualGUID(riid, kWgiIidIGamepadStatics2)) {
+      obj = static_cast<WgiIGamepadStatics2*>(this);
+    } else {
+      *ppvObject = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    *ppvObject = obj;
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return (ULONG)InterlockedIncrement(&refs_);
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    /* Immortal singleton: games may hold the factory for the whole session. */
+    if (refs_ > 0)
+      InterlockedDecrement(&refs_);
+    return (ULONG)refs_;
+  }
+  HRESULT STDMETHODCALLTYPE GetIids(ULONG* iidCount, IID** iids) override {
+    static const GUID kIids[] = {kWgiIidActivationFactory, kWgiIidIGamepadStatics,
+                                 kWgiIidIGamepadStatics2};
+    return WgiServeIids(kIids, 3, iidCount, iids);
+  }
+  HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WgiHstring* className) override {
+    return WgiServeClassName(L"Windows.Gaming.Input.Gamepad", className);
+  }
+  HRESULT STDMETHODCALLTYPE GetTrustLevel(int* trustLevel) override {
+    if (trustLevel == nullptr)
+      return E_POINTER;
+    *trustLevel = 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE ActivateInstance(WgiIInspectable** instance) override {
+    if (instance == nullptr)
+      return E_POINTER;
+    *instance = nullptr;
+    Dlog("wgi: ActivateInstance on the statics-only Gamepad class (E_NOTIMPL)");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE add_GamepadAdded(WgiIEventHandlerGamepad* value,
+                                            WgiEventToken* token) override {
+    if (value == nullptr || token == nullptr)
+      return E_POINTER;
+    InterlockedIncrement64(&g_wgiAddedSubs);
+    int slot = -1;
+    if (g_wgiLockInit == 1) {
+      EnterCriticalSection(&g_wgiLock);
+      for (int i = 0; i < WGI_MAX_HANDLERS; ++i) {
+        if (g_wgiAddedHandlers[i] == nullptr) {
+          slot = i;
+          break;
+        }
+      }
+      if (slot >= 0) {
+        value->AddRef();
+        g_wgiAddedHandlers[slot] = value;
+      }
+      LeaveCriticalSection(&g_wgiLock);
+    }
+    token->value = slot + 1; /* 0 = handler table full */
+    if (InterlockedCompareExchange64(&g_wgiAddedLogged, 1, 0) == 0)
+      Dlog("wgi: GamepadAdded subscribed (slot=%d; the fake pad is enumerable "
+           "from the first get_Gamepads, so no Added event is raised)",
+           slot);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_GamepadAdded(WgiEventToken token) override {
+    if (g_wgiLockInit != 1 || token.value <= 0 || token.value > WGI_MAX_HANDLERS)
+      return S_OK;
+    EnterCriticalSection(&g_wgiLock);
+    WgiIEventHandlerGamepad* h = g_wgiAddedHandlers[token.value - 1];
+    g_wgiAddedHandlers[token.value - 1] = nullptr;
+    LeaveCriticalSection(&g_wgiLock);
+    if (h != nullptr)
+      h->Release();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE add_GamepadRemoved(WgiIEventHandlerGamepad* value,
+                                               WgiEventToken* token) override {
+    if (value == nullptr || token == nullptr)
+      return E_POINTER;
+    int slot = -1;
+    if (g_wgiLockInit == 1) {
+      EnterCriticalSection(&g_wgiLock);
+      for (int i = 0; i < WGI_MAX_HANDLERS; ++i) {
+        if (g_wgiRemovedHandlers[i] == nullptr) {
+          slot = i;
+          break;
+        }
+      }
+      if (slot >= 0) {
+        value->AddRef();
+        g_wgiRemovedHandlers[slot] = value;
+      }
+      LeaveCriticalSection(&g_wgiLock);
+    }
+    token->value = slot + 1;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE remove_GamepadRemoved(WgiEventToken token) override {
+    if (g_wgiLockInit != 1 || token.value <= 0 || token.value > WGI_MAX_HANDLERS)
+      return S_OK;
+    EnterCriticalSection(&g_wgiLock);
+    WgiIEventHandlerGamepad* h = g_wgiRemovedHandlers[token.value - 1];
+    g_wgiRemovedHandlers[token.value - 1] = nullptr;
+    LeaveCriticalSection(&g_wgiLock);
+    if (h != nullptr)
+      h->Release();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE get_Gamepads(WgiIVectorViewGamepad** value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    InterlockedIncrement64(&g_wgiListCalls);
+    // Always serve the fake pad so the streaming client controls the game even
+    // when a physical controller is attached. The real system view is skipped.
+    if (InterlockedCompareExchange64(&g_wgiListLogged, 1, 0) == 0)
+      Dlog("wgi: get_Gamepads serving the fake pad (one connected, neutral)");
+    *value = new WgiFakeVectorView();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE FromGameController(void* controller,
+                                               WgiIGamepad** value) override {
+    if (value == nullptr)
+      return E_POINTER;
+    *value = nullptr;
+    if (controller == nullptr)
+      return E_POINTER;
+    if (WgiIsFakePadController(controller)) {
+      WgiAcquireFakePad(value);
+      return S_OK;
+    }
+    /* UE5 calls Gamepad::FromGameController(rawController) to map the raw
+       controller it discovered through RawGameControllerAdded onto the
+       standard Gamepad surface; the fake raw controller resolves to the
+       fake Gamepad so both surfaces share one identity. */
+    if (WgiIsFakeRawController(controller)) {
+      WgiAcquireFakePad(value);
+      return S_OK;
+    }
+    /* The fake pad is the only device the streaming client ever drives.
+       Never fall through to the real OS GamepadStatics2::FromGameController,
+       otherwise a physically-attached controller would resolve to the real
+       Gamepad surface and bypass the fake. */
+    return E_INVALIDARG;
+  }
+
+ private:
+  volatile LONG refs_; ///< Object reference count (floor of one: immortal).
+};
+
+/** The single fake statics object (immortal; created by WgiFakeInstall). */
+static WgiFakeStatics* g_wgiFakeStaticsObj = nullptr;
+
+/**
+ * @brief Log the first activation of each Windows.Gaming.Input class.
+ *
+ * Budgeted to one log line per distinct class name, so a live session shows
+ * which other WinRT input surfaces (RawGameController and friends) the game
+ * touches without spamming the log.
+ * @param name The activatable class name.
+ */
+static void WgiObserveClass(const wchar_t* name) {
+  bool fresh = false;
+  if (g_wgiLockInit == 1) {
+    EnterCriticalSection(&g_wgiLock);
+    bool seen = false;
+    for (int i = 0; i < g_wgiSeenCount; ++i) {
+      if (wcscmp(g_wgiSeenNames[i], name) == 0) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen && g_wgiSeenCount < 16) {
+      wcsncpy(g_wgiSeenNames[g_wgiSeenCount], name, 47);
+      g_wgiSeenNames[g_wgiSeenCount][47] = 0;
+      ++g_wgiSeenCount;
+      fresh = true;
+    }
+    LeaveCriticalSection(&g_wgiLock);
+  }
+  if (fresh)
+    Dlog("wgi: observed activation of %ls (passthrough)", name);
+}
+
+/**
+ * @brief Hooked combase!RoGetActivationFactory.
+ *
+ * Intercepts the activation of Windows.Gaming.Input.Gamepad and serves the
+ * fake statics for the factory interfaces it implements (IGamepadStatics,
+ * IGamepadStatics2, IActivationFactory, IInspectable, IUnknown); every other
+ * activation - other Gamepad interfaces and every other class - passes
+ * through the real resolver.
+ * @param activatableClassId The activatable class name.
+ * @param iid The requested factory interface.
+ * @param[out] factory Receives the factory.
+ * @return S_OK when the fake statics was served, otherwise the real
+ * resolver's HRESULT.
+ */
+static HRESULT WINAPI MyRoGetActivationFactory(WgiHstring activatableClassId,
+                                               REFIID iid, void** factory) {
+  InterlockedIncrement64(&g_wgiRoGetCalls);
+  FnWgiRoGetActivationFactory real = g_realRoGetActivationFactory;
+  if (real == nullptr)
+    return REGDB_E_CLASSNOTREG;
+  const wchar_t* name = nullptr;
+  if (activatableClassId != nullptr && g_wgiGetStringRawBuffer != nullptr) {
+    UINT32 len = 0;
+    name = g_wgiGetStringRawBuffer(activatableClassId, &len);
+  }
+  if (name != nullptr) {
+    static volatile LONG s_rogetLogged = 0;
+    if (InterlockedIncrement(&s_rogetLogged) <= 10)
+      Dlog("wgi: RoGetActivationFactory class=%ls", name);
+  }
+  if (name != nullptr && wcscmp(name, L"Windows.Gaming.Input.Gamepad") == 0) {
+    InterlockedIncrement64(&g_wgiGamepadActivations);
+    if (InterlockedCompareExchange64(&g_wgiActLogged, 1, 0) == 0)
+      Dlog("wgi: Gamepad activation intercepted");
+    if (IsEqualGUID(iid, kWgiIidIGamepadStatics) ||
+        IsEqualGUID(iid, kWgiIidIGamepadStatics2) ||
+        IsEqualGUID(iid, kWgiIidActivationFactory) ||
+        IsEqualGUID(iid, kWgiIidInspectable) || IsEqualGUID(iid, kWgiIidUnknown)) {
+      if (g_wgiFakeStaticsObj != nullptr)
+        return g_wgiFakeStaticsObj->QueryInterface(iid, factory);
+    }
+  } else if (name != nullptr && wcscmp(name, L"Windows.Gaming.Input.RawGameController") == 0) {
+    if (InterlockedCompareExchange64(&g_wgiRawActLogged, 1, 0) == 0)
+      Dlog("wgi: RawGameController activation intercepted");
+    if (IsEqualGUID(iid, kWgiIidIRawGameControllerStatics) ||
+        IsEqualGUID(iid, kWgiIidActivationFactory) ||
+        IsEqualGUID(iid, kWgiIidInspectable) || IsEqualGUID(iid, kWgiIidUnknown)) {
+      if (g_wgiFakeRawStaticsObj != nullptr)
+        return g_wgiFakeRawStaticsObj->QueryInterface(iid, factory);
+    }
+  } else if (name != nullptr && wcsncmp(name, L"Windows.Gaming.Input.", 21) == 0) {
+    WgiObserveClass(name);
+  }
+  return real(activatableClassId, iid, factory);
+}
+
+/**
+ * @brief Whether the Windows.Gaming.Input fake gamepad is enabled via the
+ * settings file ("XInputFakeWgi", default 0).
+ *
+ * UE5 titles read the controller through Windows.Gaming.Input instead of
+ * XInput; this layer presents the same one-pad illusion on that API surface:
+ * the Gamepad statics are replaced by a fake that serves one connected pad
+ * (fed from the XInput UDP snapshots) whenever the OS itself reports none.
+ * Like the XInput serve family it is intentionally not armed-gated: games
+ * enumerate the pad once at startup and never look again.
+ * @return True when the WGI fake gamepad should be presented.
+ */
+static bool XInputFakeWgiEnabled(void) {
+  return FileDword("XInputFakeWgi", 1) != 0;
+}
+
+/**
+ * @brief Install the Windows.Gaming.Input fake gamepad (XInputFakeWgi=1).
+ *
+ * Captures the real OS Gamepad statics first so the fake can pass real
+ * controllers through, then detours combase!RoGetActivationFactory. The
+ * XInput slot lock is initialized here too, so the layer also works in
+ * configurations where the XInput hook family stayed off.
+ */
+/**
+ * @brief Vtable thunk: get_Gamepads returns the fake pad view directly.
+ *
+ * Avoids recursion by not calling the real statics.
+ */
+static HRESULT STDMETHODCALLTYPE WgiVtableGetGamepads_Thunk(
+    void* /*self*/, WgiIVectorViewGamepad** value) {
+  if (value == nullptr)
+    return E_POINTER;
+  InterlockedIncrement64(&g_wgiListCalls);
+  *value = new WgiFakeVectorView();
+  if (InterlockedCompareExchange64(&g_wgiListLogged, 1, 0) == 0)
+    Dlog("wgi: vtable get_Gamepads serving fake pad");
+  return S_OK;
+}
+
+/**
+ * @brief Vtable thunk: add_GamepadAdded delegates to the fake statics.
+ */
+static HRESULT STDMETHODCALLTYPE WgiVtableAddGamepadAdded_Thunk(
+    void* /*self*/, WgiIEventHandlerGamepad* value, WgiEventToken* token) {
+  InterlockedIncrement64(&g_wgiAddedSubs);
+  if (InterlockedCompareExchange64(&g_wgiAddLogged, 1, 0) == 0)
+    Dlog("wgi: vtable add_GamepadAdded intercepted");
+  return g_wgiFakeStaticsObj->add_GamepadAdded(value, token);
+}
+
+/**
+ * @brief Vtable thunk: add_GamepadRemoved delegates to the fake statics.
+ */
+static HRESULT STDMETHODCALLTYPE WgiVtableAddGamepadRemoved_Thunk(
+    void* /*self*/, WgiIEventHandlerGamepad* value, WgiEventToken* token) {
+  return g_wgiFakeStaticsObj->add_GamepadRemoved(value, token);
+}
+
+/**
+ * @brief Vtable thunk: FromGameController maps fake controllers to the fake
+ * Gamepad, and delegates real controllers to the original vtable slot.
+ */
+static HRESULT STDMETHODCALLTYPE WgiVtableFromGameController_Thunk(
+    void* self, void* controller, WgiIGamepad** value) {
+  if (value == nullptr)
+    return E_POINTER;
+  *value = nullptr;
+  if (controller == nullptr)
+    return E_POINTER;
+  {
+    static volatile LONG s_fgcLogged = 0;
+    if (InterlockedCompareExchange(&s_fgcLogged, 1, 0) == 0)
+      Dlog("wgi: vtable FromGameController intercepted");
+  }
+  if (WgiIsFakePadController(controller) || WgiIsFakeRawController(controller)) {
+    WgiAcquireFakePad(value);
+    return S_OK;
+  }
+  if (g_wgiOrigStatics2Vtable != nullptr) {
+    auto origFn = reinterpret_cast<HRESULT (STDMETHODCALLTYPE*)(void*, void*, WgiIGamepad**)>(
+        g_wgiOrigStatics2Vtable[6]);
+    return origFn(self, controller, value);
+  }
+  return E_INVALIDARG;
+}
+
+static void WgiFakeInstall(void) {
+  if (!XInputFakeWgiEnabled()) {
+    Dlog("wgi: fake gamepad skipped (XInputFakeWgi=0)");
+    return;
+  }
+  if (g_wgiLockInit != 1) {
+    InitializeCriticalSection(&g_wgiLock);
+    InterlockedExchange(&g_wgiLockInit, 1);
+  }
+  if (g_xinputLockInit != 1) {
+    InitializeCriticalSection(&g_xinputLock);
+    InterlockedExchange(&g_xinputLockInit, 1);
+    memset(g_xinputSlots, 0, sizeof(g_xinputSlots));
+  }
+  HMODULE comb = GetModuleHandleW(L"combase.dll");
+  if (comb == nullptr)
+    comb = LoadLibraryW(L"combase.dll");
+  if (comb == nullptr) {
+    Dlog("wgi: combase.dll unavailable, fake gamepad skipped");
+    return;
+  }
+  g_wgiGetStringRawBuffer =
+      (FnWgiGetStringRawBuffer)GetProcAddress(comb, "WindowsGetStringRawBuffer");
+  g_wgiCreateString = (FnWgiCreateString)GetProcAddress(comb, "WindowsCreateString");
+  g_wgiDeleteString = (FnWgiDeleteString)GetProcAddress(comb, "WindowsDeleteString");
+  if (g_wgiGetStringRawBuffer == nullptr) {
+    Dlog("wgi: WindowsGetStringRawBuffer missing, fake gamepad skipped");
+    return;
+  }
+  LARGE_INTEGER freq;
+  if (QueryPerformanceFrequency(&freq) && freq.QuadPart > 0)
+    g_wgiQpcFreqHz = (std::uint64_t)freq.QuadPart;
+  memset(&g_wgiVibration, 0, sizeof(g_wgiVibration));
+  memset(g_wgiAddedHandlers, 0, sizeof(g_wgiAddedHandlers));
+  memset(g_wgiRemovedHandlers, 0, sizeof(g_wgiRemovedHandlers));
+
+  const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  const bool coInit = (coHr == S_OK);
+  Dlog("wgi: install begin (CoInitializeEx hr=0x%08lX)", (unsigned long)coHr);
+
+  /* Capture the OS statics BEFORE the detour goes in: the fake passes real
+     controllers through, so the object it forwards to must be the genuine
+     one obtained through the unhooked resolver. */
+  FARPROC roGet = GetProcAddress(comb, "RoGetActivationFactory");
+  if (roGet != nullptr && g_wgiCreateString != nullptr) {
+    WgiHstring className = nullptr;
+    if (SUCCEEDED(g_wgiCreateString(L"Windows.Gaming.Input.Gamepad", 28, &className)) &&
+        className != nullptr) {
+      WgiIGamepadStatics* real = nullptr;
+      const HRESULT hr = ((FnWgiRoGetActivationFactory)roGet)(
+          className, kWgiIidIGamepadStatics, (void**)&real);
+      if (SUCCEEDED(hr) && real != nullptr) {
+        WgiIGamepadStatics2* real2 = nullptr;
+        real->QueryInterface(kWgiIidIGamepadStatics2, (void**)&real2);
+        EnterCriticalSection(&g_wgiLock);
+        g_wgiRealStatics = real;
+        g_wgiRealStatics2 = real2;
+        LeaveCriticalSection(&g_wgiLock);
+        Dlog("wgi: real Gamepad statics captured (statics=%p statics2=%p)",
+             (void*)real, (void*)real2);
+      } else {
+        Dlog("wgi: real Gamepad statics unavailable hr=0x%08lX (fake serves alone)",
+             (unsigned long)hr);
+      }
+      if (g_wgiDeleteString != nullptr)
+        g_wgiDeleteString(className);
+    }
+  }
+
+  g_wgiFakePadObj = new WgiFakeGamepad();
+  g_wgiFakePadI = static_cast<WgiIGamepad*>(g_wgiFakePadObj);
+  g_wgiFakeStaticsObj = new WgiFakeStatics();
+
+  /* Capture the OS RawGameController statics BEFORE the detour goes in, and
+     glean the parameterized collection IIDs (IVectorView/IIterable<
+     RawGameController>) from the real view's GetIids. The fake view answers
+     the IIterable QI that C++/WinRT's range-for issues before First() through
+     these IIDs; without them the enumeration walk throws hresult_no_interface. */
+  if (roGet != nullptr && g_wgiCreateString != nullptr) {
+    WgiHstring rawName = nullptr;
+    if (SUCCEEDED(g_wgiCreateString(L"Windows.Gaming.Input.RawGameController", 37,
+                                    &rawName)) &&
+        rawName != nullptr) {
+      WgiIRawGameControllerStatics* rawReal = nullptr;
+      const HRESULT hr = ((FnWgiRoGetActivationFactory)roGet)(
+          rawName, kWgiIidIRawGameControllerStatics, (void**)&rawReal);
+      if (SUCCEEDED(hr) && rawReal != nullptr) {
+        EnterCriticalSection(&g_wgiLock);
+        g_wgiRealRawStatics = rawReal;
+        LeaveCriticalSection(&g_wgiLock);
+        Dlog("wgi: real RawGameController statics captured (statics=%p)", (void*)rawReal);
+        WgiIVectorViewRawGameController* realView = nullptr;
+        if (SUCCEEDED(rawReal->get_RawGameControllers(&realView)) && realView != nullptr) {
+          ULONG iidCount = 0;
+          IID* iidList = nullptr;
+          if (SUCCEEDED(realView->GetIids(&iidCount, &iidList)) && iidList != nullptr) {
+            int collected = 0;
+            for (ULONG i = 0; i < iidCount && collected < 4; ++i) {
+              if (!IsEqualGUID(iidList[i], kWgiIidInspectable) &&
+                  !IsEqualGUID(iidList[i], kWgiIidUnknown))
+                g_wgiRawViewIids[collected++] = iidList[i];
+            }
+            g_wgiRawViewIidCount = collected;
+            CoTaskMemFree(iidList);
+            Dlog("wgi: gleaned %d RawGameController collection IIDs from the real view",
+                 collected);
+          }
+          realView->Release();
+        }
+      } else {
+        Dlog("wgi: real RawGameController statics unavailable hr=0x%08lX (fake serves alone)",
+             (unsigned long)hr);
+      }
+      if (g_wgiDeleteString != nullptr)
+        g_wgiDeleteString(rawName);
+    }
+  }
+
+  g_wgiFakeRawPadObj = new WgiFakeRawGamepad();
+  g_wgiFakeRawPadI = static_cast<WgiIRawGameController*>(g_wgiFakeRawPadObj);
+  g_wgiFakeRawStaticsObj = new WgiFakeRawStatics();
+
+  if (roGet != nullptr) {
+    void* real = (void*)roGet;
+    if (DetourInstall((void*)roGet, (void*)&MyRoGetActivationFactory, &real,
+                      &g_detourRoGet)) {
+      g_realRoGetActivationFactory = (FnWgiRoGetActivationFactory)real;
+      g_exportRoGetActivationFactory = (void*)roGet;
+      InterlockedExchange(&g_wgiInstalled, 1);
+      Dlog("wgi: RoGetActivationFactory hooked (target=%p)", (void*)roGet);
+    } else {
+      Dlog("wgi: RoGetActivationFactory hook failed, fake gamepad not served");
+    }
+  } else {
+    Dlog("wgi: RoGetActivationFactory missing, fake gamepad not served");
+  }
+  /* Vtable-hook the real Gamepad statics so that games which already hold
+     the OS statics pointer (obtained before injection) also see the fake
+     pad. This is the critical path for hot-plug: the game subscribed to
+     GamepadAdded via the real statics before we could intercept
+     RoGetActivationFactory, so we must rewrite the vtable in-place. */
+  if (g_wgiRealStatics != nullptr) {
+    void** origVt = *reinterpret_cast<void***>(g_wgiRealStatics);
+    if (origVt != nullptr) {
+      void** copy = (void**)malloc(sizeof(void*) * 11);
+      if (copy != nullptr) {
+        for (int i = 0; i < 11; ++i)
+          copy[i] = origVt[i];
+        copy[6] = (void*)&WgiVtableAddGamepadAdded_Thunk;
+        copy[8] = (void*)&WgiVtableAddGamepadRemoved_Thunk;
+        copy[10] = (void*)&WgiVtableGetGamepads_Thunk;
+        g_wgiOrigStaticsVtable = origVt;
+        g_wgiFakeStaticsVtable = copy;
+        *reinterpret_cast<void***>(g_wgiRealStatics) = copy;
+        Dlog("wgi: real Gamepad statics vtable hooked (Added+Removed+get_Gamepads)");
+      }
+    }
+  }
+  if (g_wgiRealStatics2 != nullptr) {
+    void** origVt = *reinterpret_cast<void***>(g_wgiRealStatics2);
+    if (origVt != nullptr) {
+      void** copy = (void**)malloc(sizeof(void*) * 7);
+      if (copy != nullptr) {
+        for (int i = 0; i < 7; ++i)
+          copy[i] = origVt[i];
+        copy[6] = (void*)&WgiVtableFromGameController_Thunk;
+        g_wgiOrigStatics2Vtable = origVt;
+        g_wgiFakeStatics2Vtable = copy;
+        *reinterpret_cast<void***>(g_wgiRealStatics2) = copy;
+        Dlog("wgi: real Gamepad statics2 vtable hooked (FromGameController)");
+      }
+    }
+  }
+  Dlog("wgi: fake gamepad armed (XInputFakeWgi=1)");
+  if (coInit)
+    CoUninitialize();
+}
+
+/**
+ * @brief Undo the WGI fake layer.
+ *
+ * Removes the resolver detour and releases everything the layer holds. The
+ * fake objects themselves stay alive: the game may still hold interface
+ * pointers into them, and their methods are harmless once the hook is gone
+ * (they only read slot state that stops updating).
+ */
+static void WgiFakeRestore(void) {
+  if (g_wgiInstalled != 1)
+    return;
+  if (g_exportRoGetActivationFactory != nullptr)
+    DetourRestore(&g_detourRoGet, (void**)&g_realRoGetActivationFactory,
+                  g_exportRoGetActivationFactory);
+  InterlockedExchange(&g_wgiInstalled, 0);
+  if (g_wgiLockInit == 1) {
+    EnterCriticalSection(&g_wgiLock);
+    if (g_wgiFakeStaticsVtable != nullptr) {
+      free(g_wgiFakeStaticsVtable);
+      g_wgiFakeStaticsVtable = nullptr;
+    }
+    g_wgiOrigStaticsVtable = nullptr;
+    if (g_wgiFakeStatics2Vtable != nullptr) {
+      free(g_wgiFakeStatics2Vtable);
+      g_wgiFakeStatics2Vtable = nullptr;
+    }
+    g_wgiOrigStatics2Vtable = nullptr;
+    g_wgiRealStatics = nullptr;
+    g_wgiRealStatics2 = nullptr;
+    WgiIRawGameControllerStatics* rawReal = g_wgiRealRawStatics;
+    g_wgiRealRawStatics = nullptr;
+    for (int i = 0; i < WGI_MAX_HANDLERS; ++i) {
+      if (g_wgiAddedHandlers[i] != nullptr) {
+        g_wgiAddedHandlers[i]->Release();
+        g_wgiAddedHandlers[i] = nullptr;
+      }
+      if (g_wgiRemovedHandlers[i] != nullptr) {
+        g_wgiRemovedHandlers[i]->Release();
+        g_wgiRemovedHandlers[i] = nullptr;
+      }
+      if (g_wgiRawAddedHandlers[i] != nullptr) {
+        g_wgiRawAddedHandlers[i]->Release();
+        g_wgiRawAddedHandlers[i] = nullptr;
+      }
+      if (g_wgiRawRemovedHandlers[i] != nullptr) {
+        g_wgiRawRemovedHandlers[i]->Release();
+        g_wgiRawRemovedHandlers[i] = nullptr;
+      }
+    }
+    LeaveCriticalSection(&g_wgiLock);
+    if (rawReal != nullptr)
+      rawReal->Release();
+  }
+  Dlog("wgi: fake gamepad restored");
 }
 
 /* ------------------------------------------------------------------ */
@@ -6861,7 +9061,6 @@ static DWORD WINAPI HotPlugNudgeThread(LPVOID param) {
     if (g_target && IsWindow(g_target)) {
       PostMessageW(g_target, WM_DEVICECHANGE, 0x0007 /* DBT_DEVNODES_CHANGED */,
                    0);
-      Dlog("hotplug: nudge round %d/%d sent to target", i + 1, rounds);
       PostMessageW(g_target, WM_DEVICECHANGE, 0x8000 /* DBT_DEVICEARRIVAL */,
                    (LPARAM)&g_arrivalHid);
       Dlog("hotplug: arrival (hid interface) sent to target");
@@ -6871,7 +9070,6 @@ static DWORD WINAPI HotPlugNudgeThread(LPVOID param) {
     } else {
       PostMessageW(HWND_BROADCAST, WM_DEVICECHANGE,
                    0x0007 /* DBT_DEVNODES_CHANGED */, 0);
-      Dlog("hotplug: nudge round %d/%d broadcast", i + 1, rounds);
     }
     Sleep(2500);
   }
@@ -7157,93 +9355,6 @@ static bool FocusSpoofDisabled(void) {
 }
 
 /**
- * @brief Log one window's identity to the worker log.
- *
- * Used by the input-routing diagnosis so the window layout of the target
- * process is visible: a click that never reaches the subclassed main window
- * lands on one of these (a child render surface, a caption button, or a
- * second top-level window). The class name alone usually reveals which one
- * the engine routes input through.
- *
- * @param h The window handle.
- * @param kind Label shown before the handle ("top" or "child").
- */
-static void LogWindowInfo(HWND h, const char* kind) {
-  char cls[128] = "?";
-  WCHAR title[256] = L"?";
-  GetClassNameA(h, cls, sizeof(cls));
-  GetWindowTextW(h, title, 256);
-  DWORD pid = 0;
-  DWORD tid = GetWindowThreadProcessId(h, &pid);
-  RECT r;
-  GetWindowRect(h, &r);
-  Dlog("  %s h=%p class=%s title=%ls vis=%d tid=%lu rect=%ld,%ld %ldx%ld",
-       kind, (void*)h, cls, title, IsWindowVisible(h) ? 1 : 0, tid, r.left,
-       r.top, r.right - r.left, r.bottom - r.top);
-}
-
-/**
- * @brief Callback: log one child window (WNDENUMPROC-compatible; a plain
- * lambda does not convert to the 32-bit stdcall WNDENUMPROC type).
- * @param c Child window handle.
- * @param lp Unused.
- * @return Always TRUE to keep enumerating.
- */
-static BOOL CALLBACK EnumChildForDiag(HWND c, LPARAM lp) {
-  (void)lp;
-  LogWindowInfo(c, "child");
-  return TRUE;
-}
-
-/**
- * @brief Callback: log one top-level window of the process and its children.
- * @param h Window handle.
- * @param lp Expected to point at the target process id.
- * @return Always True to keep enumerating.
- */
-static BOOL CALLBACK EnumTopForDiag(HWND h, LPARAM lp) {
-  DWORD pid = 0;
-  GetWindowThreadProcessId(h, &pid);
-  if (pid == (DWORD)lp) {
-    LogWindowInfo(h, "top");
-    EnumChildWindows(h, EnumChildForDiag, 0);
-  }
-  return TRUE;
-}
-
-/**
- * @brief Dump the target process's window tree and raw-input registration.
- *
- * This is the decisive diagnostic for the "click dies but the subclassed
- * window sees nothing" symptom: it shows (a) whether the render surface is
- * a child or a separate top-level window, and (b) whether raw input is
- * registered anywhere in the process (and in that case on which window it
- * sinks). Called once from the worker right before spoofing goes live, so
- * the report is in the same log as the subsequent click trace.
- */
-static void DumpInputRouting(void) {
-  DWORD selfPid = GetCurrentProcessId();
-  Dlog("== input routing (pid=%lu) ==", selfPid);
-  EnumWindows(EnumTopForDiag, (LPARAM)selfPid);
-
-  UINT devCount = 0;
-  UINT cbItem = sizeof(RAWINPUTDEVICELIST);
-  GetRegisteredRawInputDevices(NULL, &devCount, cbItem);
-  Dlog("raw-input: %u device(s) registered by this process", devCount);
-  if (devCount > 0 && devCount < 64) {
-    RAWINPUTDEVICELIST list[64];
-    /* The API fills RAWINPUTDEVICELIST entries despite the parameter being
-       typed PRAWINPUTDEVICE (a long-standing SDK quirk). */
-    if (GetRegisteredRawInputDevices((PRAWINPUTDEVICE)list, &devCount,
-                                     cbItem)) {
-      for (UINT i = 0; i < devCount; i++)
-        Dlog("  rawdevice h=%p type=%u", list[i].hDevice, list[i].dwType);
-    }
-  }
-  Dlog("== input routing end ==");
-}
-
-/**
  * @brief Heartbeat thread: proves the worker lives independently of the
  * game's UI thread.
  *
@@ -7278,45 +9389,60 @@ static DWORD WINAPI HeartbeatThread(LPVOID param) {
                       (long long)InterlockedExchangeAdd64(
                           &g_xinputRuntimes[i].callsGetState, 0));
     }
-    Dlog("heartbeat %ld wmInputSeen=%lld udp=%lld slot0btn=%04x getstate=%lld served=%lld caps=%lld capsex=%lld set=%lld bat=%lld key=%lld enable=%lld dsound=%lld audiodev=%lld di_enum=%lld di_create=%lld di_status=%lld di_state=%lld di_fmt=%lld di_obj=%lld di_data=%lld di_caps=%lld di_info=%lld di_objinfo=%lld di_setprop=%lld di_event=%lld di_poll=%lld di_acq=%lld di_unacq=%lld di_coop=%lld rawlist=%lld rawinfo=%lld rawreg=%lld armed=%d wmiquery=%lld dibound=%lld wmicalls=%d gen=%u%s",
-         n, (long long)InterlockedExchangeAdd64(&g_wmInputSeen, 0),
-         (long long)InterlockedExchangeAdd64(&g_udpDatagrams, 0), btn0,
-         (long long)InterlockedExchangeAdd64(&g_xinputGetStateCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputServedFresh, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputCapsCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputCapsExCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputSetCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputBatteryCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputKeystrokeCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputEnableCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputDsoundCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_xinputAudioIdsCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diEnumCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diCreateCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diStatusCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diStateCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diFormatCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diObjCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diDataCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diCapsCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diInfoCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diObjInfoCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diSetPropCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diEventCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diPollCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diAcquireCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diUnacquireCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_diCoopCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_rawListCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_rawInfoCalls, 0),
-         (long long)InterlockedExchangeAdd64(&g_rawRegCalls, 0), FakeArmed() ? 1 : 0,
-         // wmiquery / dibound are STICKY state the auto-rescan driver polls, not
-         // per-interval counters: read them without clearing, or a heartbeat that
-         // lands between the driver's arm and its observation eats the adoption
-         // signal and the driver wrongly concludes the game ignored the pad.
-         (long long)InterlockedCompareExchange64(&g_wmiPnpQueried, 0, 0),
-         (long long)InterlockedCompareExchange64(&g_fakeDiBound, 0, 0), WmiCallCount(),
-         FakeIdentityGen(), rtbuf);
+if (g_state != 1 || n % 60 == 0) {
+      Dlog("heartbeat %ld wmInputSeen=%lld fgw=%lld fgws=%lld aw=%lld aws=%lld foc=%lld focs=%lld udp=%lld slot0btn=%04x getstate=%lld served=%lld caps=%lld capsex=%lld set=%lld bat=%lld key=%lld enable=%lld dsound=%lld audiodev=%lld di_enum=%lld di_create=%lld di_status=%lld di_state=%lld di_fmt=%lld di_obj=%lld di_data=%lld di_caps=%lld di_info=%lld di_objinfo=%lld di_setprop=%lld di_event=%lld di_poll=%lld di_acq=%lld di_unacq=%lld di_coop=%lld rawlist=%lld rawinfo=%lld rawreg=%lld armed=%d wmiquery=%lld dibound=%lld wmicalls=%d gen=%u roget=%lld wgiact=%lld wgilist=%lld wgiread=%lld wgifresh=%lld wgiadd=%lld wgivib=%lld%s",
+           n, (long long)InterlockedExchangeAdd64(&g_wmInputSeen, 0),
+           (long long)InterlockedExchangeAdd64(&g_fgwCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_fgwSpoofed, 0),
+           (long long)InterlockedExchangeAdd64(&g_awCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_awSpoofed, 0),
+           (long long)InterlockedExchangeAdd64(&g_focusCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_focusSpoofed, 0),
+           (long long)InterlockedExchangeAdd64(&g_udpDatagrams, 0), btn0,
+           (long long)InterlockedExchangeAdd64(&g_xinputGetStateCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputServedFresh, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputCapsCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputCapsExCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputSetCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputBatteryCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputKeystrokeCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputEnableCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputDsoundCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_xinputAudioIdsCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diEnumCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diCreateCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diStatusCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diStateCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diFormatCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diObjCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diDataCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diCapsCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diInfoCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diObjInfoCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diSetPropCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diEventCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diPollCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diAcquireCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diUnacquireCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_diCoopCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_rawListCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_rawInfoCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_rawRegCalls, 0), FakeArmed() ? 1 : 0,
+           // wmiquery / dibound are STICKY state the auto-rescan driver polls, not
+           // per-interval counters: read them without clearing, or a heartbeat that
+           // lands between the driver's arm and its observation eats the adoption
+           // signal and the driver wrongly concludes the game ignored the pad.
+           (long long)InterlockedCompareExchange64(&g_wmiPnpQueried, 0, 0),
+           (long long)InterlockedCompareExchange64(&g_fakeDiBound, 0, 0), WmiCallCount(),
+           FakeIdentityGen(),
+           (long long)InterlockedExchangeAdd64(&g_wgiRoGetCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_wgiGamepadActivations, 0),
+           (long long)InterlockedExchangeAdd64(&g_wgiListCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_wgiReadCalls, 0),
+           (long long)InterlockedExchangeAdd64(&g_wgiServedFresh, 0),
+           (long long)InterlockedExchangeAdd64(&g_wgiAddedSubs, 0),
+           (long long)InterlockedExchangeAdd64(&g_wgiVibCalls, 0), rtbuf);
+}
   }
   return 0;
 }
@@ -7333,22 +9459,31 @@ static DWORD WINAPI HeartbeatThread(LPVOID param) {
  */
 static DWORD WINAPI WorkerThread(LPVOID param) {
   (void)param;
-  Trace("worker: sleeping 500ms");
   Sleep(500);
   if (InterlockedExchangeAdd(&g_stop, 0) == 1)
     return 0;
 
   if (FocusSpoofDisabled()) {
-    Trace("focus spoof disabled by config; doing nothing");
     return 0;
   }
 
   ResetWorkerLog();
   g_workerLog = 1;
   g_diagEvents = FileDword("DiagFocusEvents", 0);
-  if (g_diagEvents == 1)
-    Dlog("wndproc message tracing enabled (DiagFocusEvents=1)");
   Dlog("worker started, pid=%lu", GetCurrentProcessId());
+  /* Identity of the process we were injected into. The controller supplies the
+     target window from the PID it chose, so a wrong-PID injection (a launcher,
+     a helper, or a second instance) would otherwise look identical to a
+     working injection whose hooks simply never fire. The image path names the
+     real host once and for all, and matches the host-side
+     "Capturing audio from process [pid]" line. */
+  {
+    char selfPath[MAX_PATH];
+    selfPath[0] = '\0';
+    if (!GetModuleFileNameA(NULL, selfPath, MAX_PATH))
+      snprintf(selfPath, sizeof(selfPath), "?");
+    Dlog("worker: injected image=\"%s\"", selfPath);
+  }
 
   /* Prefer the window handle passed by the controller ("TargetWindow" in
      the settings file). Only fall back to self-discovery when the controller
@@ -7371,11 +9506,9 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
     if (ctlTarget) {
       Dlog("controller target %p stale or foreign; self-discovering",
            (void*)ctlTarget);
-      Trace("controller target invalid; falling back to self-discovery");
     }
     g_target = FindTargetWindow();
     if (!g_target) {
-      Trace("no target window found");
       Dlog("no target window found");
       InterlockedExchange(&g_state, 0);
       return 0;
@@ -7383,7 +9516,20 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
     Dlog("target window=%p (self-discovered)",
          (void*)g_target);
   }
-  Trace("target window=%p", (void*)g_target);
+  /* Which window the spoof is anchored to. The class name distinguishes the
+     real game window (e.g. "UnrealWindow") from a launcher/overlay/splash
+     window that happens to be the largest one, and the title confirms it is
+     THIS title rather than a foreign process window the controller handed us.
+     Logged for both the controller-supplied and the self-discovered paths. */
+  {
+    char cls[256];
+    char title[256];
+    cls[0] = '\0';
+    title[0] = '\0';
+    GetClassNameA(g_target, cls, sizeof(cls));
+    GetWindowTextA(g_target, title, sizeof(title));
+    Dlog("target: class=\"%s\" title=\"%s\"", cls, title);
+  }
 
   /* Enable spoofing once we have a valid target; both the probe hooks and
      the subclass read g_state as the on/off switch. */
@@ -7391,51 +9537,20 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 
   /* Detours first: they intercept every call path and redirect g_real* to
      the trampolines. */
-  Dlog("worker: installing detours");
+  /* One consolidated progress line instead of the old installing/done pair
+     for every subsystem. */
+  Dlog("worker: installing detours + subclass + input/cursor blocks + fake pads");
   DetourHookInstall();
-  Dlog("worker: detours done");
-
-  if (SubclassEnabled()) {
-    Dlog("worker: subclass enabled via config");
-    if (!SubClassInstall()) {
-      Trace("subclass install failed");
-      Dlog("subclass install failed (non-fatal)");
-    } else {
-      Dlog("worker: subclass done");
-    }
-  } else {
-    Dlog("worker: subclass skipped (EnableSubclass=0)");
-  }
-
-  Dlog("worker: blocking keyboard/mouse");
+  if (SubclassEnabled() && !SubClassInstall())
+    Dlog("subclass install failed (non-fatal)");
   InputBlockHookInstall();
-  Dlog("worker: keyboard/mouse blocked (if enabled)");
-
-  Dlog("worker: installing cursor-control hooks");
   CursorBlockHookInstall();
-  Dlog("worker: cursor-control hooks done");
-
-  Dlog("worker: installing xinput hooks");
   XInputHookInstall();
-  Dlog("worker: xinput hooks done (if enabled)");
-
-  Dlog("worker: installing directinput8 fake pad");
   Di8HookInstall();
-  Dlog("worker: directinput8 fake pad done (if enabled)");
-
-  Dlog("worker: installing raw-input fake HID device");
   RawFakeInstall();
-  Dlog("worker: raw-input fake HID device done (if enabled)");
-
-  /* Presentation layers for the XInput path: the virtual HID device the game
-     must see through SetupDi/HidD, and the WMI Win32_PNPEntity entry its
-     "is this an XInput pad?" filter looks for. */
-  Dlog("worker: installing virtual HID device (SetupDi/HidD)");
   HidSetupDiHookInstall();
-  Dlog("worker: virtual HID device done (if enabled)");
-  Dlog("worker: installing WMI Win32_PNPEntity fake");
   WmiPnpInstall();
-  Dlog("worker: WMI Win32_PNPEntity fake done (if enabled)");
+  WgiFakeInstall();
 
   /* Two-stage activation:
      - XInputFakeRescan=1 (default): the auto-rescan driver waits for the game
@@ -7453,9 +9568,7 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
       CreateThread(NULL, 0, HotPlugNudgeThread, 0, 0, NULL);
   }
 
-  Trace("focus spoof active");
   Dlog("focus spoof active");
-  DumpInputRouting();
   CreateThread(NULL, 0, HeartbeatThread, 0, 0, NULL);
   return 0;
 }
@@ -7518,6 +9631,8 @@ static BOOL SpoofStopImpl(void) {
   InterlockedExchange(&g_fakeArmed, 0);
   HidSetupDiHookRestore();
   WmiPnpRestore();
+  WgiFakeRestore();
+  Dlog("stop: wgi fake gamepad restored");
   if (g_target) {
     /* Stale install is harmless (SwallowProc is pass-through when off),
        but try to restore cleanly anyway. */
